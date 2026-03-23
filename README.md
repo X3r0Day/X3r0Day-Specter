@@ -241,6 +241,6 @@ This is a tool in active development. Check [PLAN.md](PLAN.md) for what's coming
 
 ---
 
-License: See [LICENSE](LICENSE)
+License: See [LICENSE](LICENSE) (MIT License)
 
-Copyright (c) 2026 X3r0Day Team. All rights reserved.
+Copyright (c) 2026 X3r0Day Team

@@ -1,6 +1,6 @@
 ######################################################################
 # Part of X3r0Day Project. See LICENSE.md for licensing information.
-# (C) 2026 X3r0Day Team. All rights reserved.
+# MIT License - Commercial use, Modification, Distribution, Private use allowed.
 ######################################################################
 
 """
