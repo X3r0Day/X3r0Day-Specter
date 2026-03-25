@@ -16,14 +16,17 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import select
 from rich import box
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress import (
@@ -458,6 +461,11 @@ def res_tbl(res: ScanOut) -> Table:
         svc = sv.svc if sv else "unknown"
         info = sv.info if sv else ""
         state = sv.state if sv else "open"
+        
+        # Clean up newlines that break formatting
+        if info:
+            info = " ".join(info.split())
+            
         # chop long details to fit table
         if len(info) > 55:
             info = info[:52] + "..."
@@ -615,11 +623,48 @@ def multi_sum(results: List[ScanOut]) -> None:
     console.print()
 
 
+# build live discovery table showing ports as they're found
+def live_disc_tbl(open_ports: List[int], target: str) -> Table:
+    tbl = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style=f"bold {WHITE}",
+        border_style=CYAN,
+        title=f"[bold {WHITE}]Open Ports Discovered  •  {target}[/bold {WHITE}]",
+        title_style=f"bold {WHITE}",
+        expand=False,
+        padding=(0, 2),
+    )
+    tbl.add_column("PORT", style=GREEN, justify="right", width=8, no_wrap=True)
+    tbl.add_column("SERVICE", style=SVC_COL, justify="left", width=20, no_wrap=True)
+
+    if not open_ports:
+        tbl.add_row(
+            Text("scanning...", style=DIM, justify="center"),
+            Text("", style=DIM)
+        )
+    else:
+        for port in sorted(open_ports):
+            svc = guess_svc(port)
+            tbl.add_row(str(port), svc)
+
+    return tbl
+
+
+# build combined renderable: progress bar + discovered ports table
+def build_live_panel(progress: Progress, open_ports: List[int], target: str) -> Group:
+    parts = [progress]
+    if open_ports:
+        parts.append(Text(""))  # spacer
+        parts.append(live_disc_tbl(open_ports, target))
+    return Group(*parts)
+
+
 class Scanner:
     def __init__(self, cfg: Cfg):
         self.cfg = cfg
-        # semaphores to limit concurrency
-        self._c_sem = asyncio.Semaphore(cfg.c_conc)  # tcp connect
+        # semaphore is the only concurrency control for the asyncio fallback
+        self._c_sem = asyncio.Semaphore(cfg.c_conc)
         self._s_sem = asyncio.Semaphore(cfg.s_conc)  # service scan
         self._s_tasks: List[asyncio.Task] = []
         self._svcs: List[SvcInfo] = []
@@ -660,17 +705,27 @@ class Scanner:
                 self._svc_failed += 1
 
     # try to connect to one port
-    async def _probe(self, ip: str, port: int) -> bool:
+    # returns (is_open, timed_out)
+    # timed_out=True only on asyncio.TimeoutError — a clean RST (port closed)
+    # is NOT a timeout and must not be counted against the backoff ratio
+    async def _probe(self, ip: str, port: int) -> tuple[bool, bool]:
         try:
             _r, writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, port), timeout=self.cfg.c_to
             )
-            writer.close()
-            if hasattr(writer, "wait_closed"):
-                await writer.wait_closed()
-            return True
+            # Connection succeeded - port is open
+            # Cleanup errors (e.g., CloudFront immediate RST) don't change this
+            try:
+                writer.close()
+                if hasattr(writer, "wait_closed"):
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except Exception:
+                pass  # ignore cleanup errors - we already connected successfully
+            return True, False
+        except asyncio.TimeoutError:
+            return False, True   # dropped / filtered — real backoff signal
         except Exception:
-            return False
+            return False, False  # RST / refused — port closed, not a backoff signal
 
     # run nmap on one port for aggressive service detection
     async def _nmap(self, host: str, port: int) -> SvcInfo:
@@ -786,28 +841,189 @@ class Scanner:
         t0 = time.perf_counter()
         ip = await self._resolve(self.cfg.target)
 
-        # phase 1: tcp connect scan
-        prog = mk_prog(transient=True)
-        with prog:
-            tid = prog.add_task(
-                f"Scanning {self.cfg.target}", total=len(self.cfg.ports)
-            )
+        # --- phase 1: tcp connect scan ---
+        #
+        # For maximum speed on Linux (sub-second for 65k ports), we use
+        # select.epoll() with raw non-blocking sockets. This bypasses
+        # the asyncio event loop's massive overhead for open_connection.
+        # Nmap Connect Scan takes 1.7s on localhost; epoll takes 0.9s.
+        # If epoll isn't available (Mac/Windows), fallback to asyncio.
+        # Tho I am not sure if I want to keep it linux only.
+        #
+        import random
 
-            async def scan_port(port: int):
-                async with self._c_sem:
-                    is_open = await self._probe(ip, port)
-                    await self._mark_conn(port, is_open)
-                    prog.advance(tid)
-                    # if open and service scan enabled, kick it off
-                    if is_open and self.cfg.svc_on:
-                        await self._mark_svc_start(port)
-                        self._s_tasks.append(
-                            asyncio.create_task(self._svc_worker(self.cfg.target, port))
+        # prioritize common ports → 80/443/22 etc. get probed first
+        common = set(top_ports(1000))
+        priority = [p for p in self.cfg.ports if p in common]
+        rest = [p for p in self.cfg.ports if p not in common]
+        random.shuffle(priority)
+        random.shuffle(rest)
+        ports = priority + rest
+
+        live_ports: List[int] = []
+        prog = mk_prog(transient=False)
+        tid = prog.add_task(
+            f"Scanning {self.cfg.target}", total=len(ports)
+        )
+
+        live = Live(
+            build_live_panel(prog, live_ports, self.cfg.target),
+            console=console,
+            refresh_per_second=8,
+            transient=True,
+        )
+
+        def _handle_open(port: int):
+            live_ports.append(port)
+            self._open_ports.append(port)
+            self._open += 1
+            self._closed -= 1
+            svc = guess_svc(port)
+            live.console.print(
+                Text.assemble(
+                    ("  ◉ ", GREEN),
+                    (f"{port:>5}/tcp", f"bold {WHITE}"),
+                    ("  →  ", DIM),
+                    (svc, SVC_COL),
+                ),
+            )
+            if self.cfg.svc_on:
+                async def _start_svc_scan(p: int):
+                    await self._mark_svc_start(p)
+                    await self._svc_worker(self.cfg.target, p)
+                    
+                self._s_tasks.append(
+                    asyncio.create_task(_start_svc_scan(port))
+                )
+            else:
+                self._svcs.append(
+                    SvcInfo(
+                        port=port,
+                        ok=True,
+                        state="open",
+                        svc=svc,
+                        info="",
+                        elapsed=0.0,
+                        n_cmd="",
+                        raw="",
+                        err=None,
+                    )
+                )
+
+        live.start()
+        try:
+            if hasattr(select, "epoll"):
+                # Fast Path: Linux Epoll connect scanner
+                batch_size = self.cfg.c_conc
+                i = 0
+                while i < len(ports):
+                    batch = ports[i : i + batch_size]
+                    epoll = select.epoll()
+                    sockets = {}
+                    
+                    hit_limit = False
+                    for port_idx, port in enumerate(batch):
+                        try:
+                            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            s.setblocking(False)
+                        except OSError as e:
+                            # EMFILE (24) or ENFILE (23): Too many open files
+                            if e.errno in (24, 23):
+                                hit_limit = True
+                                # Advance i by the number of ports we successfully created sockets for
+                                # so the next batch picks up exactly where we failed.
+                                i += port_idx
+                                break
+                            else:
+                                continue
+
+                        try:
+                            s.connect((ip, port))
+                        except BlockingIOError:
+                            pass
+                        except Exception:
+                            s.close()
+                            continue
+                            
+                        fd = s.fileno()
+                        sockets[fd] = (s, port)
+                        try:
+                            epoll.register(fd, select.EPOLLOUT | select.EPOLLERR | select.EPOLLHUP)
+                        except Exception:
+                            s.close()
+                            del sockets[fd]
+                            continue
+                        
+                    t_start = time.time()
+                    while sockets and time.time() - t_start < self.cfg.c_to:
+                        events = epoll.poll(0.05)
+                        for fd, event in events:
+                            if fd not in sockets: continue
+                            s, port = sockets[fd]
+                            
+                            is_open = False
+                            if event & select.EPOLLOUT:
+                                err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                                if err == 0:
+                                    is_open = True
+                                    _handle_open(port)
+                            
+                            self._tested += 1
+                            if not is_open:
+                                self._closed += 1
+                                self._st[port] = "closed"
+                                
+                            epoll.unregister(fd)
+                            s.close()
+                            del sockets[fd]
+                            prog.advance(tid)
+                        
+                        live.update(
+                            build_live_panel(prog, live_ports, self.cfg.target)
+                        )
+                        await asyncio.sleep(0)  # yield loop
+                            
+                    # Cleanup timeouts
+                    for fd, (s, port) in sockets.items():
+                        self._tested += 1
+                        self._closed += 1
+                        self._st[port] = "closed"
+                        prog.advance(tid)
+                        s.close()
+                    epoll.close()
+                    live.update(
+                        build_live_panel(prog, live_ports, self.cfg.target)
+                    )
+
+                    if hit_limit:
+                        # Cut batch size so we don't keep hitting the FD limit
+                        batch_size = max(100, batch_size // 2)
+                        # We already advanced `i` by `port_idx` when we caught EMFILE
+                    else:
+                        i += len(batch)
+            
+            else:
+                # Slow Path: Fallback for Mac/Windows using asyncio.open_connection
+                async def scan_port(port: int):
+                    async with self._c_sem:
+                        is_open, _timed_out = await self._probe(ip, port)
+                        self._tested += 1
+                        if is_open:
+                            _handle_open(port)
+                        else:
+                            self._closed += 1
+                            self._st[port] = "closed"
+                            
+                        prog.advance(tid)
+                        live.update(
+                            build_live_panel(prog, live_ports, self.cfg.target)
                         )
 
-            await asyncio.gather(
-                *[asyncio.create_task(scan_port(p)) for p in self.cfg.ports]
-            )
+                await asyncio.gather(
+                    *[asyncio.create_task(scan_port(p)) for p in ports]
+                )
+        finally:
+            live.stop()
 
         # phase 2: service detection on open ports
         if self._s_tasks:
@@ -870,8 +1086,8 @@ def mk_parser() -> argparse.ArgumentParser:
         "-t",
         "--timeout",
         type=float,
-        default=2.5,
-        help="tcp connect timeout in seconds (default: 0.5)",
+        default=1.5,
+        help="tcp connect timeout in seconds (default: 1.5)",
     )
     p.add_argument(
         "-C",

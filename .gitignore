@@ -50,6 +50,14 @@ todo.txt
 results.json
 output/
 testsImpl.md
+temp/
+tests/
 
 # ruff
 .ruff_cache/
+__pycache__/
+*.pyc
+result.json
+nmap_out.txt
+result/
+.env

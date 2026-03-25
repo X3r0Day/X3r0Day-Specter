@@ -1,7 +1,7 @@
-######################################################################
+##################################################################################
 # Part of X3r0Day Project. See LICENSE.md for licensing information.
 # MIT License - Commercial use, Modification, Distribution, Private use allowed.
-######################################################################
+##################################################################################
 
 """
 cli entry point for x3r0day security toolkit

@@ -79,7 +79,7 @@ Aggressive mode (`-S`) runs nmap with `-sV -A`. Slower but gives you version inf
 | Short | Long | Type | Default | Description |
 |-------|------|------|---------|-------------|
 | `-c` | `--concurrency` | int | 1000 | Max concurrent TCP connections |
-| `-t` | `--timeout` | float | 0.5 | TCP connect timeout in seconds |
+| `-t` | `--timeout` | float | 1.5 | TCP connect timeout in seconds |
 | `-C` | `--svc-concurrency` | int | 20 | Concurrent service scans |
 
 #### Service detection
