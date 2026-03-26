@@ -48,6 +48,7 @@ Thumbs.db
 todo.txt
 *.log
 results.json
+subdomains.json
 output/
 testsImpl.md
 temp/
