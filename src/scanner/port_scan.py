@@ -3,7 +3,16 @@ async tcp port scanner with realtime per-port service detection
 
 refs:
 - https://nmap.org/book/man.html
-- https://en.wikipedia.org/wiki/Asynchronous_I/O
+- https://nmap.org/book/vscan.html
+- https://nmap.org/book/output-formats-xml-output.html
+- https://nmap.org/book/nmap-services.html
+- https://docs.python.org/3/library/asyncio-stream.html
+- https://docs.python.org/3/library/socket.html
+- https://docs.python.org/3/library/ssl.html
+- https://docs.python.org/3/library/xml.etree.elementtree.html
+- https://www.rfc-editor.org/rfc/rfc4253
+- https://www.rfc-editor.org/rfc/rfc8446
+- https://www.rfc-editor.org/rfc/rfc9112
 """
 
 import argparse
