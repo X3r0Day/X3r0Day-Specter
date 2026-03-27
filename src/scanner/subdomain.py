@@ -1,5 +1,5 @@
 """
-async subdomain enumerator: passive sources + brute force + parallel nmap + page scraping
+async subdomain enumerator: passive sources + brute force + async port scanning + page scraping
 
 refs:
 - https://crt.sh/?q=%25.domain&output=json
@@ -13,16 +13,20 @@ refs:
 
 import argparse
 import asyncio
+import csv
+import html
+import io
 import json
 import re
-import shlex
-import shutil
 import socket
 import ssl
+import struct
+import secrets
 import time
 import traceback
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -48,6 +52,8 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from .port_scan import scan_quiet
+
 # output goes here
 console = Console(highlight=False)
 
@@ -71,12 +77,34 @@ URLSCAN_URL = "https://urlscan.io/api/v1/search/?q=domain:{d}&size=200"
 RAPIDDNS_URL = "https://rapiddns.io/subdomain/{d}?full=1"
 SHODAN_DNS_URL = "https://api.shodan.io/dns/domain/{d}?key={k}"
 
-# web ports nmap checks on each resolved subdomain
+# web ports checked on each resolved subdomain
 WEB_PORTS = [80, 443, 8080, 8443, 8888, 3000, 5000, 4443]
 
 # http timeout for passive source fetches (seconds)
 # generous: crt.sh can be slow on large domains
 HTTP_TO = 30.0
+HTTP_W_MIN = 8
+HTTP_W_MAX = 64
+SCAN_TO = 1.0
+
+# DNS_PORT: standard DNS port (53)
+# DNS_TO: socket timeout in seconds for DNS queries
+# DNS_PKT_MAX: maximum UDP packet size (bytes)
+# DNS_TRIES: number of retry attempts per nameserver
+# DNS_CNAME_MAX: maximum CNAME chain depth to follow before giving up
+# DNS_QTYPE_A: query type for IPv4 address records (RFC 1035)
+# DNS_QTYPE_CNAME: query type for canonical name aliases (RFC 1035)
+# DNS_QTYPE_AAAA: query type for IPv6 address records (RFC 3596)
+# DNS_IN: DNS class for Internet (IN) records (RFC 1035)
+DNS_PORT = 53
+DNS_TO = 2.0
+DNS_PKT_MAX = 2048
+DNS_TRIES = 2
+DNS_CNAME_MAX = 6
+DNS_QTYPE_A = 1
+DNS_QTYPE_CNAME = 5
+DNS_QTYPE_AAAA = 28
+DNS_IN = 1
 
 # http user-agent for all outbound requests
 UA = "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
@@ -252,13 +280,240 @@ class _TitleParser(HTMLParser):
             self.title += data
 
 
+class _DnsErr(RuntimeError):
+    pass
+
+
+class _DnsFallback(RuntimeError):
+    pass
+
+
+@dataclass
+class _DnsRes:
+    ans: List[str]
+    fallback: bool = False
+
+
+def _load_ns() -> List[str]:
+    conf = Path("/etc/resolv.conf")
+    if not conf.exists():
+        return []
+
+    nss: List[str] = []
+    for line in conf.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or not line.startswith("nameserver"):
+            continue
+
+        parts = line.split()
+        if len(parts) >= 2:
+            nss.append(parts[1])
+
+    return nss
+
+
+def _dns_addr(ns: str):
+    fam = socket.AF_INET6 if ":" in ns else socket.AF_INET
+    if fam == socket.AF_INET6:
+        return fam, (ns, DNS_PORT, 0, 0)
+    return fam, (ns, DNS_PORT)
+
+
+def _enc_name(name: str) -> bytes:
+    labels = [label for label in name.strip(".").split(".") if label]
+    return (
+        b"".join(
+            len(label.encode("idna")).to_bytes(1, "big") + label.encode("idna")
+            for label in labels
+        )
+        + b"\x00"
+    )
+
+
+def _dec_name(pkt: bytes, off: int) -> Tuple[str, int]:
+    labels: List[str] = []
+    cur = off
+    next_off = None
+    seen: Set[int] = set()
+
+    while True:
+        if cur >= len(pkt):
+            raise _DnsErr("dns name exceeds packet bounds")
+
+        length = pkt[cur]
+        if length & 0xC0 == 0xC0:
+            if cur + 1 >= len(pkt):
+                raise _DnsErr("dns pointer truncated")
+            ptr = ((length & 0x3F) << 8) | pkt[cur + 1]
+            if ptr in seen:
+                raise _DnsErr("dns pointer loop")
+            seen.add(ptr)
+            if next_off is None:
+                next_off = cur + 2
+            cur = ptr
+            continue
+
+        if length == 0:
+            cur += 1
+            break
+
+        cur += 1
+        if cur + length > len(pkt):
+            raise _DnsErr("dns label exceeds packet bounds")
+        labels.append(pkt[cur : cur + length].decode("ascii", errors="ignore"))
+        cur += length
+
+    return ".".join(labels), next_off if next_off is not None else cur
+
+
+def _mk_query(name: str, qtype: int) -> Tuple[int, bytes]:
+    txid = secrets.randbelow(65536)
+    header = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0)
+    question = _enc_name(name) + struct.pack("!HH", qtype, DNS_IN)
+    return txid, header + question
+
+
+def _parse_resp(
+    pkt: bytes, txid: int, qtype: int
+) -> Tuple[List[str], List[str], bool, int]:
+    if len(pkt) < 12:
+        raise _DnsErr("dns packet too short")
+
+    resp_id, flags, qdcount, ancount, _nscount, _arcount = struct.unpack(
+        "!HHHHHH", pkt[:12]
+    )
+    if resp_id != txid:
+        raise _DnsErr("dns txid mismatch")
+
+    trunc = bool(flags & 0x0200)
+    rcode = flags & 0x000F
+    off = 12
+
+    for _ in range(qdcount):
+        _, off = _dec_name(pkt, off)
+        off += 4
+        if off > len(pkt):
+            raise _DnsErr("dns question truncated")
+
+    ans: List[str] = []
+    cnames: List[str] = []
+
+    for _ in range(ancount):
+        _, off = _dec_name(pkt, off)
+        if off + 10 > len(pkt):
+            raise _DnsErr("dns answer header truncated")
+
+        rr_type, rr_class, _ttl, rdlen = struct.unpack("!HHLH", pkt[off : off + 10])
+        off += 10
+        if off + rdlen > len(pkt):
+            raise _DnsErr("dns rdata truncated")
+
+        rd_off = off
+        rdata = pkt[off : off + rdlen]
+        off += rdlen
+
+        if rr_class != DNS_IN:
+            continue
+
+        if rr_type == qtype:
+            if qtype == DNS_QTYPE_A and rdlen == 4:
+                ans.append(socket.inet_ntop(socket.AF_INET, rdata))
+            elif qtype == DNS_QTYPE_AAAA and rdlen == 16:
+                ans.append(socket.inet_ntop(socket.AF_INET6, rdata))
+        elif rr_type == DNS_QTYPE_CNAME:
+            cname, _ = _dec_name(pkt, rd_off)
+            if cname:
+                cnames.append(cname.lower().strip("."))
+
+    return ans, cnames, trunc, rcode
+
+
+# small udp-first resolver.
+# if a server truncates or acts weird, we fall back to libc and move on.
+class _Dns:
+    def __init__(self, to: float = DNS_TO):
+        self._to = to
+        self._ns = _load_ns()
+
+    async def _query(self, ns: str, name: str, qtype: int) -> _DnsRes:
+        loop = asyncio.get_running_loop()
+        txid, query = _mk_query(name, qtype)
+        fam, addr = _dns_addr(ns)
+        sock = socket.socket(fam, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+
+        try:
+            await loop.sock_sendto(sock, query, addr)
+            pkt, _ = await asyncio.wait_for(
+                loop.sock_recvfrom(sock, DNS_PKT_MAX), timeout=self._to
+            )
+        finally:
+            sock.close()
+
+        ans, cnames, trunc, rcode = _parse_resp(pkt, txid, qtype)
+        if trunc:
+            return _DnsRes([], fallback=True)
+        if ans:
+            return _DnsRes(ans)
+        if cnames:
+            return _DnsRes(cnames)
+        if rcode in {2, 5}:
+            return _DnsRes([], fallback=True)
+        return _DnsRes([])
+
+    async def _lookup(self, name: str, qtype: int, depth: int = 0) -> _DnsRes:
+        if depth > DNS_CNAME_MAX:
+            return _DnsRes([], fallback=True)
+        if not self._ns:
+            return _DnsRes([], fallback=True)
+
+        need_fallback = False
+        for ns in self._ns:
+            for _ in range(DNS_TRIES):
+                try:
+                    res = await self._query(ns, name, qtype)
+                except (OSError, asyncio.TimeoutError, _DnsErr):
+                    need_fallback = True
+                    continue
+
+                if res.ans:
+                    if qtype in {DNS_QTYPE_A, DNS_QTYPE_AAAA} and all(
+                        not re.match(r"^\d+\.\d+\.\d+\.\d+$", val) and ":" not in val
+                        for val in res.ans
+                    ):
+                        return await self._lookup(res.ans[0], qtype, depth + 1)
+                    return res
+
+                if res.fallback:
+                    need_fallback = True
+                    continue
+
+                return res
+
+        return _DnsRes([], fallback=need_fallback)
+
+    async def resolve(self, host: str) -> str:
+        a_res, aaaa_res = await asyncio.gather(
+            self._lookup(host, DNS_QTYPE_A),
+            self._lookup(host, DNS_QTYPE_AAAA),
+        )
+
+        if a_res.ans:
+            return a_res.ans[0]
+        if aaaa_res.ans:
+            return aaaa_res.ans[0]
+        if a_res.fallback or aaaa_res.fallback:
+            raise _DnsFallback(host)
+        return ""
+
+
 # result from resolving + scanning one subdomain
 @dataclass
 class SubInfo:
     subdomain: str
     ip: str  # resolved ipv4/v6, empty string if no dns
     sources: List[str]  # which sources found this subdomain
-    ports: List[int]  # open web ports found by nmap
+    ports: List[int]  # open web ports found by the internal scanner
     status: int  # http status code  (0 = not scraped / unreachable)
     title: str  # HTML <title> from scraped page
     server: str  # server response header
@@ -297,11 +552,12 @@ class Cfg:
     wordlist: Optional[Path]
     nmap_on: bool
     scrape_on: bool
-    n_args: List[str]
     resolve_c: int
     nmap_c: int
     http_to: float
     debug: bool
+    verbose: int = 0
+    quiet: bool = False
 
 
 def hr(title: str = "") -> None:
@@ -332,7 +588,7 @@ def hdr(domain: str, cfg: Cfg) -> None:
     if cfg.brute:
         sources.append("bruteforce")
 
-    nmap_mode = "enabled" if cfg.nmap_on else "disabled"
+    scan_mode = "enabled" if cfg.nmap_on else "disabled"
     scrape_mode = "enabled" if cfg.scrape_on else "disabled"
 
     grid = Table.grid(padding=(0, 0))
@@ -343,7 +599,7 @@ def hdr(domain: str, cfg: Cfg) -> None:
     grid.add_column()
 
     rows = [
-        ("Domain", domain, "Nmap Scan", nmap_mode),
+        ("Domain", domain, "Port Scan", scan_mode),
         ("Sources", ", ".join(sources), "Scrape", scrape_mode),
         (
             "Resolve",
@@ -428,6 +684,17 @@ def _status_style(code: int) -> Tuple[str, str]:
     return DIM, str(code)
 
 
+def _fmt_display_ts(raw: str) -> str:
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return raw[:19].replace("T", "  ")
+
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
+    return dt.strftime("%Y-%m-%d  %H:%M:%S")
+
+
 def res_tbl(res: SubScanOut) -> Table:
     tbl = Table(
         box=box.SIMPLE_HEAD,
@@ -475,8 +742,8 @@ def stats_tbl(res: SubScanOut) -> Table:
     resolved = res.total_resolved
     unres = total - resolved
     with_web = sum(1 for s in res.subdomains if s.ports)
-    ts = res.started[:19].replace("T", "  ")
-    tf = res.finished[:19].replace("T", "  ")
+    ts = _fmt_display_ts(res.started)
+    tf = _fmt_display_ts(res.finished)
 
     grid = Table.grid(padding=(0, 4))
     grid.add_column(min_width=13, no_wrap=True)
@@ -550,9 +817,258 @@ def show(res: SubScanOut) -> None:
     console.print()
 
 
+def _out_mode(raw: str):
+    out = Path(raw)
+    if not out.suffix:
+        out = out.with_name(out.name + ".html")
+        return out, "html"
+
+    suf = out.suffix.lower()
+    if suf == ".json":
+        return out, "json"
+    if suf == ".csv":
+        return out, "csv"
+    return out, "html"
+
+
+def _csv_sub(res: SubScanOut) -> str:
+    buf = io.StringIO()
+    fields = [
+        "domain",
+        "subdomain",
+        "ip",
+        "sources",
+        "ports",
+        "status",
+        "title",
+        "server",
+        "tech",
+        "elapsed",
+        "err",
+    ]
+    wr = csv.DictWriter(buf, fieldnames=fields)
+    wr.writeheader()
+
+    rows = res.subdomains or [
+        SubInfo(
+            subdomain="",
+            ip="",
+            sources=[],
+            ports=[],
+            status=0,
+            title="",
+            server="",
+            tech=[],
+            elapsed=0.0,
+            err="",
+        )
+    ]
+    for sub in rows:
+        wr.writerow(
+            {
+                "domain": res.domain,
+                "subdomain": sub.subdomain,
+                "ip": sub.ip,
+                "sources": "|".join(sub.sources),
+                "ports": ",".join(str(p) for p in sub.ports),
+                "status": sub.status,
+                "title": sub.title,
+                "server": sub.server,
+                "tech": "|".join(sub.tech),
+                "elapsed": sub.elapsed,
+                "err": sub.err or "",
+            }
+        )
+
+    return buf.getvalue()
+
+
+def build_html(res: SubScanOut) -> str:
+    found = res.total_found
+    resolved = res.total_resolved
+    web_hits = sum(1 for s in res.subdomains if s.ports)
+    lines = [
+        "<!DOCTYPE html>",
+        "<html lang='en'>",
+        "<head>",
+        "  <meta charset='utf-8'>",
+        "  <meta name='viewport' content='width=device-width, initial-scale=1.0'>",
+        "  <title>X3R0DAY Subdomain Report</title>",
+        "  <style>",
+        "    * { box-sizing: border-box; margin: 0; padding: 0; }",
+        "    body {",
+        "      font-family: system-ui, -apple-system, sans-serif;",
+        "      background: #121212;",
+        "      color: #d4d4d4;",
+        "      font-size: 14px;",
+        "      line-height: 1.5;",
+        "      padding: 24px;",
+        "    }",
+        "    .wrap { max-width: 1100px; margin: 0 auto; }",
+        "    h1 {",
+        "      font-size: 16px;",
+        "      font-weight: 600;",
+        "      color: #e0e0e0;",
+        "      margin-bottom: 8px;",
+        "    }",
+        "    .meta { font-size: 12px; color: #707070; margin-bottom: 24px; }",
+        "    hr { border: none; border-top: 1px solid #2a2a2a; margin: 24px 0; }",
+        "    .domain { margin-bottom: 16px; }",
+        "    .domain-name { font-size: 15px; font-weight: 500; color: #c0c0c0; }",
+        "    .stats { display: flex; gap: 24px; font-size: 13px; margin-bottom: 20px; }",
+        "    .stats span { color: #606060; }",
+        "    .stats strong { color: #a0a0a0; margin-left: 4px; }",
+        "    .stats .hits strong { color: #6a9955; }",
+        "    table { width: 100%; border-collapse: collapse; }",
+        "    th {",
+        "      text-align: left;",
+        "      font-size: 11px;",
+        "      font-weight: 500;",
+        "      color: #606060;",
+        "      padding: 8px 12px;",
+        "      border-bottom: 1px solid #2a2a2a;",
+        "    }",
+        "    td {",
+        "      padding: 10px 12px;",
+        "      border-bottom: 1px solid #1e1e1e;",
+        "      vertical-align: top;",
+        "    }",
+        "    .sub { color: #9cdcfe; word-break: break-all; }",
+        "    .ip { font-family: monospace; color: #808080; font-size: 13px; }",
+        "    .status-2 { color: #6a9955; }",
+        "    .status-3 { color: #dcdcaa; }",
+        "    .status-4 { color: #f14c4c; }",
+        "    .ports { font-family: monospace; color: #808080; font-size: 12px; }",
+        "    .info { font-size: 12px; color: #606060; }",
+        "    details { margin-top: 4px; }",
+        "    summary {",
+        "      color: #505050;",
+        "      cursor: pointer;",
+        "      font-size: 11px;",
+        "      list-style: none;",
+        "      display: flex;",
+        "      align-items: center;",
+        "      gap: 4px;",
+        "    }",
+        "    summary::-webkit-details-marker { display: none; }",
+        "    summary::before { content: '▶'; font-size: 8px; transition: transform 0.1s; }",
+        "    details[open] summary::before { transform: rotate(90deg); }",
+        "    .detail-box {",
+        "      margin-top: 8px;",
+        "      padding: 12px;",
+        "      background: #1a1a1a;",
+        "      border: 1px solid #2a2a2a;",
+        "      border-radius: 4px;",
+        "      font-family: monospace;",
+        "      font-size: 12px;",
+        "      color: #808080;",
+        "      white-space: pre-wrap;",
+        "      word-break: break-all;",
+        "      max-height: 200px;",
+        "      overflow-y: auto;",
+        "    }",
+        "    .empty { color: #606060; font-size: 13px; padding: 16px 0; }",
+        "  </style>",
+        "</head>",
+        "<body>",
+        "  <div class='wrap'>",
+        "    <h1>Subdomain Report</h1>",
+        f"    <p class='meta'>X3R0DAY Specter &middot; {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>",
+    ]
+
+    lines.append("    <hr>")
+    lines.append("    <div class='domain'>")
+    lines.append(f"      <div class='domain-name'>{html.escape(res.domain)}</div>")
+    lines.append("    </div>")
+
+    lines.append("    <div class='stats'>")
+    lines.append(f"      <span>Found<strong>{found}</strong></span>")
+    lines.append(f"      <span>Resolved<strong>{resolved}</strong></span>")
+    lines.append(
+        f"      <span>No DNS<strong>{max(found - resolved, 0)}</strong></span>"
+    )
+    lines.append(f"      <span class='hits'>Web Hits<strong>{web_hits}</strong></span>")
+    lines.append(f"      <span>{res.elapsed:.2f}s</span>")
+    lines.append("    </div>")
+
+    if not res.subdomains:
+        lines.append("    <p class='empty'>No subdomains discovered</p>")
+    else:
+        lines.append("    <table>")
+        lines.append(
+            "      <thead><tr><th>Subdomain</th><th style='width:120px'>IP</th><th style='width:80px'>Status</th><th style='width:100px'>Ports</th><th>Info</th></tr></thead>"
+        )
+        lines.append("      <tbody>")
+
+        for sub in res.subdomains:
+            status_cls = "info"
+            if 200 <= sub.status < 300:
+                status_cls = "status-2"
+            elif 300 <= sub.status < 400:
+                status_cls = "status-3"
+            elif sub.status >= 400:
+                status_cls = "status-4"
+
+            status_str = str(sub.status) if sub.status else "-"
+            ports_str = ", ".join(str(p) for p in sub.ports) if sub.ports else "-"
+            title_short = sub.title[:60] + "..." if len(sub.title) > 60 else sub.title
+            title_full = sub.title
+
+            lines.append("      <tr>")
+            lines.append(f"        <td class='sub'>{html.escape(sub.subdomain)}</td>")
+            lines.append(f"        <td class='ip'>{html.escape(sub.ip or '-')}</td>")
+            lines.append(f"        <td class='{status_cls}'>{status_str}</td>")
+            lines.append(f"        <td class='ports'>{html.escape(ports_str)}</td>")
+            lines.append("        <td class='info'>")
+
+            if len(title_full) > 60:
+                lines.append(f"          {html.escape(title_short)}")
+                lines.append(f"          <details>")
+                lines.append(f"            <summary>show more</summary>")
+                lines.append(
+                    f"            <div class='detail-box'>Title: {html.escape(title_full)}"
+                )
+                if sub.server:
+                    lines.append(f"Server: {html.escape(sub.server)}")
+                if sub.tech:
+                    lines.append(f"Tech: {html.escape(', '.join(sub.tech))}")
+                if sub.err:
+                    lines.append(f"Error: {html.escape(sub.err)}")
+                lines.append(f"            </div>")
+                lines.append(f"          </details>")
+            else:
+                info_parts = []
+                if sub.title:
+                    info_parts.append(sub.title)
+                if sub.server:
+                    info_parts.append(f"({sub.server})")
+                lines.append(f"          {html.escape(' '.join(info_parts) or '-')}")
+
+            lines.append("        </td>")
+            lines.append("      </tr>")
+
+        lines.append("      </tbody>")
+        lines.append("    </table>")
+
+    if res.errors:
+        lines.append("    <details style='margin-top: 16px;'>")
+        lines.append("      <summary>Show Errors</summary>")
+        lines.append("      <div class='detail-box'>")
+        for err in res.errors:
+            lines.append(html.escape(err))
+        lines.append("      </div>")
+        lines.append("    </details>")
+
+    lines.append("  </div>")
+    lines.append("</body>")
+    lines.append("</html>")
+
+    return "\n".join(lines)
+
+
 """
 blocking http get: always uses relaxed SSL context, follows redirects,
-caps body at max_bytes. called via run_in_executor so asyncio never blocks.
+caps body at max_bytes.
 
 returns (status_code, body_bytes, headers_dict, error_string)
 status is 0 on connection / timeout failure, and error_string will be populated.
@@ -578,16 +1094,6 @@ def _http_get(
         return 0, b"", {}, str(exc)
 
 
-# async wrapper: all source fetches and scrapes go through here
-async def _aget(
-    url: str,
-    timeout: float = HTTP_TO,
-    max_bytes: int = 5 << 20,
-) -> Tuple[int, bytes, Dict[str, str], str]:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: _http_get(url, timeout, max_bytes))
-
-
 class SubScanner:
     def __init__(self, cfg: Cfg):
         self.cfg = cfg
@@ -595,16 +1101,74 @@ class SubScanner:
         self._lock = asyncio.Lock()
         self._resolve_sem = asyncio.Semaphore(cfg.resolve_c)
         self._nmap_sem = asyncio.Semaphore(cfg.nmap_c)
+        self._http_w = max(HTTP_W_MIN, min(HTTP_W_MAX, cfg.resolve_c))
+        self._http_sem = asyncio.Semaphore(self._http_w)
+        self._http_pool = ThreadPoolExecutor(
+            max_workers=self._http_w, thread_name_prefix="sub-http"
+        )
+        self._dns_pool = ThreadPoolExecutor(
+            max_workers=max(4, min(32, cfg.resolve_c)),
+            thread_name_prefix="sub-dns-fallback",
+        )
+        self._dns = _Dns()
+        self._res_cache: Dict[str, str] = {}
         self._errors: List[str] = []
         self._total_raw = 0
+
+    def _v(self, msg: str):
+        if self.cfg.verbose > 0 and not self.cfg.quiet:
+            console.print(Text(f"  {msg}", style=DIMMER))
+
+    def _err(self, msg: str):
+        self._errors.append(msg)
+        if self.cfg.verbose > 0 and not self.cfg.quiet:
+            console.print(Text(f"  !  {msg}", style=YELLOW))
+
+    # keep blocking urllib work off the event loop
+    async def _aget(
+        self,
+        url: str,
+        to: float = HTTP_TO,
+        max_b: int = 5 << 20,
+    ) -> Tuple[int, bytes, Dict[str, str], str]:
+        async with self._http_sem:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                self._http_pool, lambda: _http_get(url, to, max_b)
+            )
+
+    # libc fallback for truncated replies or dns servers that misbehave
+    async def _sys_resolve(self, host: str) -> str:
+        loop = asyncio.get_running_loop()
+        try:
+            infos = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self._dns_pool,
+                    lambda: socket.getaddrinfo(
+                        host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+                    ),
+                ),
+                timeout=4.0,
+            )
+        except Exception:
+            return ""
+
+        for family, _socktype, _proto, _canonname, sockaddr in infos:
+            if family in {socket.AF_INET, socket.AF_INET6}:
+                return sockaddr[0]
+        return ""
+
+    def close(self) -> None:
+        self._http_pool.shutdown(wait=False, cancel_futures=True)
+        self._dns_pool.shutdown(wait=False, cancel_futures=True)
 
     async def _src_crtsh(self, domain: str) -> List[Tuple[str, str]]:
         url = CRTSH_URL.format(d=domain)
         try:
-            # Increased timeout to 90s, and set max_bytes to -1 for unlimited buffer
-            code, body, _, err = await _aget(url, timeout=90.0, max_bytes=-1)
+            # crt.sh can be painfully slow on larger domains
+            code, body, _, err = await self._aget(url, to=90.0, max_b=-1)
             if not body:
-                self._errors.append(f"crt.sh: empty response (http {code}), {err}")
+                self._err(f"crt.sh: empty response (http {code}), {err}")
                 return []
             rows = json.loads(body.decode("utf-8", errors="replace"))
             subs: Set[str] = set()
@@ -615,24 +1179,22 @@ class SubScanner:
                         subs.add(val)
             return [(s, "crt.sh") for s in subs]
         except json.JSONDecodeError as exc:
-            self._errors.append(f"crt.sh: JSON parse error, {exc}")
+            self._err(f"crt.sh: JSON parse error, {exc}")
             return []
         except Exception as exc:
-            self._errors.append(f"crt.sh: {exc}")
+            self._err(f"crt.sh: {exc}")
             return []
 
     async def _src_hackertarget(self, domain: str) -> List[Tuple[str, str]]:
         url = HACKERTARGET_URL.format(d=domain)
         try:
-            code, body, _, err = await _aget(url)
+            code, body, _, err = await self._aget(url)
             if not body:
-                self._errors.append(
-                    f"hackertarget: empty response (http {code}), {err}"
-                )
+                self._err(f"hackertarget: empty response (http {code}), {err}")
                 return []
             text = body.decode("utf-8", errors="replace").strip()
             if text.lower().startswith("error") or "api count" in text.lower():
-                self._errors.append(f"hackertarget: rate limited, {text[:80]}")
+                self._err(f"hackertarget: rate limited, {text[:80]}")
                 return []
             subs: Set[str] = set()
             for line in text.splitlines():
@@ -643,15 +1205,15 @@ class SubScanner:
                         subs.add(s)
             return [(s, "hackertarget") for s in subs]
         except Exception as exc:
-            self._errors.append(f"hackertarget: {exc}")
+            self._err(f"hackertarget: {exc}")
             return []
 
     async def _src_alienvault(self, domain: str) -> List[Tuple[str, str]]:
         url = ALIENVAULT_URL.format(d=domain)
         try:
-            code, body, _, err = await _aget(url)
+            code, body, _, err = await self._aget(url)
             if not body:
-                self._errors.append(f"alienvault: empty response (http {code}) {err}")
+                self._err(f"alienvault: empty response (http {code}) {err}")
                 return []
             data = json.loads(body.decode("utf-8", errors="replace"))
             subs: Set[str] = set()
@@ -661,18 +1223,18 @@ class SubScanner:
                     subs.add(hostname)
             return [(s, "alienvault") for s in subs]
         except json.JSONDecodeError as exc:
-            self._errors.append(f"alienvault: JSON parse error, {exc}")
+            self._err(f"alienvault: JSON parse error, {exc}")
             return []
         except Exception as exc:
-            self._errors.append(f"alienvault: {exc}")
+            self._err(f"alienvault: {exc}")
             return []
 
     async def _src_urlscan(self, domain: str) -> List[Tuple[str, str]]:
         url = URLSCAN_URL.format(d=domain)
         try:
-            code, body, _, err = await _aget(url)
+            code, body, _, err = await self._aget(url)
             if not body:
-                self._errors.append(f"urlscan: empty response (http {code}) {err}")
+                self._err(f"urlscan: empty response (http {code}) {err}")
                 return []
             data = json.loads(body.decode("utf-8", errors="replace"))
             subs: Set[str] = set()
@@ -683,18 +1245,18 @@ class SubScanner:
                         subs.add(dm.lower())
             return [(s, "urlscan") for s in subs]
         except json.JSONDecodeError as exc:
-            self._errors.append(f"urlscan: JSON parse error, {exc}")
+            self._err(f"urlscan: JSON parse error, {exc}")
             return []
         except Exception as exc:
-            self._errors.append(f"urlscan: {exc}")
+            self._err(f"urlscan: {exc}")
             return []
 
     async def _src_rapiddns(self, domain: str) -> List[Tuple[str, str]]:
         url = RAPIDDNS_URL.format(d=domain)
         try:
-            code, body, _, err = await _aget(url)
+            code, body, _, err = await self._aget(url)
             if not body:
-                self._errors.append(f"rapiddns: empty response (http {code}) {err}")
+                self._err(f"rapiddns: empty response (http {code}) {err}")
                 return []
             text = body.decode("utf-8", errors="replace")
             subs: Set[str] = set()
@@ -710,19 +1272,19 @@ class SubScanner:
                     subs.add(line)
             return [(s, "rapiddns") for s in subs]
         except Exception as exc:
-            self._errors.append(f"rapiddns: {exc}")
+            self._err(f"rapiddns: {exc}")
             return []
 
     async def _src_shodan(self, domain: str, key: str) -> List[Tuple[str, str]]:
         url = SHODAN_DNS_URL.format(d=domain, k=key)
         try:
-            code, body, _, err = await _aget(url)
+            code, body, _, err = await self._aget(url)
             if not body:
-                self._errors.append(f"shodan: empty response (http {code}) {err}")
+                self._err(f"shodan: empty response (http {code}) {err}")
                 return []
             data = json.loads(body.decode("utf-8", errors="replace"))
             if "error" in data:
-                self._errors.append(f"shodan: {data['error']}")
+                self._err(f"shodan: {data['error']}")
                 return []
             subs: Set[str] = set()
             for sub in data.get("subdomains", []):
@@ -733,10 +1295,10 @@ class SubScanner:
                     subs.add(f"{subdomain}.{domain}".lower())
             return [(s, "shodan") for s in subs]
         except json.JSONDecodeError as exc:
-            self._errors.append(f"shodan: JSON parse error, {exc}")
+            self._err(f"shodan: JSON parse error, {exc}")
             return []
         except Exception as exc:
-            self._errors.append(f"shodan: {exc}")
+            self._err(f"shodan: {exc}")
             return []
 
     async def _src_brute(self, domain: str, words: List[str]) -> List[Tuple[str, str]]:
@@ -748,16 +1310,9 @@ class SubScanner:
             async with self._lock:
                 if candidate in self._found:
                     return
-            async with self._resolve_sem:
-                try:
-                    loop = asyncio.get_running_loop()
-                    await asyncio.wait_for(
-                        loop.getaddrinfo(candidate, None), timeout=3.0
-                    )
-                    async with lock:
-                        results.append((candidate, "bruteforce"))
-                except Exception:
-                    pass
+            if await self._resolve(candidate):
+                async with lock:
+                    results.append((candidate, "bruteforce"))
 
         await asyncio.gather(*[_try(w) for w in words])
         return results
@@ -765,47 +1320,48 @@ class SubScanner:
     # dns resolution
 
     async def _resolve(self, host: str) -> str:
+        if host in self._res_cache:
+            return self._res_cache[host]
+
         async with self._resolve_sem:
-            loop = asyncio.get_running_loop()
             try:
-                infos = await asyncio.wait_for(
-                    loop.getaddrinfo(host, None, type=socket.SOCK_STREAM),
-                    timeout=4.0,
-                )
-                return infos[0][4][0]
+                if host in self._res_cache:
+                    return self._res_cache[host]
+
+                try:
+                    ip = await self._dns.resolve(host)
+                except _DnsFallback:
+                    ip = await self._sys_resolve(host)
+
+                self._res_cache[host] = ip
+                return ip
             except Exception:
+                self._res_cache[host] = ""
                 return ""
 
-    async def _nmap_sub(self, ip: str) -> List[int]:
-        if not self.cfg.nmap_on or not shutil.which("nmap"):
+    async def _scan_web(self, sub: str, ip: str) -> List[int]:
+        if not self.cfg.nmap_on:
             return []
 
         async with self._nmap_sem:
-            ports_str = ",".join(str(p) for p in WEB_PORTS)
-            cmd = (
-                ["nmap", "-Pn", "-n", "--open", "-p", ports_str]
-                + self.cfg.n_args
-                + [ip]
-            )
-
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
+                res = await scan_quiet(
+                    sub,
+                    WEB_PORTS,
+                    rip=ip,
+                    concurrency=len(WEB_PORTS),
+                    timeout=SCAN_TO,
                 )
-            except FileNotFoundError:
+            except Exception as exc:
+                self._err(f"port scan [{sub}]: {exc}")
                 return []
 
-            out_b, _ = await proc.communicate()
-            out = (out_b or b"").decode(errors="replace")
-
-            open_ports = []
-            for line in out.splitlines():
-                m = re.match(r"^\s*(\d+)/tcp\s+open", line)
-                if m:
-                    open_ports.append(int(m.group(1)))
-            return open_ports
+            for err in res.errors:
+                self._err(f"port scan [{sub}]: {err}")
+            if self.cfg.verbose > 0:
+                ports = ", ".join(str(p) for p in sorted(res.open_ports)) or "-"
+                self._v(f"scan  {sub}  ->  {ports}")
+            return sorted(res.open_ports)
 
     # web scraping
 
@@ -815,11 +1371,11 @@ class SubScanner:
         scheme = "https" if https else "http"
         url = f"{scheme}://{sub}/" if port in (80, 443) else f"{scheme}://{sub}:{port}/"
 
-        code, body, hdrs, _ = await _aget(
-            url, timeout=self.cfg.http_to, max_bytes=65536
-        )
+        code, body, hdrs, err = await self._aget(url, to=self.cfg.http_to, max_b=65536)
 
         if code == 0:
+            if err and self.cfg.verbose > 0:
+                self._v(f"scrape  {url}  ->  {err[:80]}")
             return 0, "", "", []
 
         # extract <title>
@@ -861,6 +1417,14 @@ class SubScanner:
             if re.search(pat, snip) and name not in tech:
                 tech.append(name)
 
+        if self.cfg.verbose > 0:
+            bits = [f"scrape  {url}", f"code={code}"]
+            if title:
+                bits.append(f"title={title[:50]}")
+            if server:
+                bits.append(f"server={server[:32]}")
+            self._v("  ".join(bits))
+
         return code, title, server, tech
 
     """
@@ -900,12 +1464,17 @@ class SubScanner:
         ip = await self._resolve(sub)
 
         if ip:
-            nmap_task = asyncio.create_task(self._nmap_sub(ip))
-            open_ports = await nmap_task
+            open_ports = await self._scan_web(sub, ip)
             code, title, server, tech = await self._scrape(sub, open_ports)
+            sub_err = (
+                "scrape failed"
+                if self.cfg.scrape_on and open_ports and code == 0
+                else None
+            )
         else:
             open_ports = []
             code, title, server, tech = 0, "", "", []
+            sub_err = "no dns"
 
         info = SubInfo(
             subdomain=sub,
@@ -917,6 +1486,7 @@ class SubScanner:
             server=server,
             tech=tech,
             elapsed=round(time.perf_counter() - t0, 3),
+            err=sub_err,
         )
 
         async with self._lock:
@@ -940,9 +1510,10 @@ class SubScanner:
         # per-source counts printed immediately so you can see what's working
         #
 
-        console.print()
-        hr("Passive Enumeration")
-        console.print()
+        if not self.cfg.quiet:
+            console.print()
+            hr("Passive Enumeration")
+            console.print()
 
         source_coros = [
             self._src_crtsh(domain),
@@ -962,18 +1533,20 @@ class SubScanner:
 
         # merge + print per-source result counts
         sub_sources: Dict[str, List[str]] = {}
-        console.print()
+        if not self.cfg.quiet:
+            console.print()
 
         for name, result in zip(src_names, batch):
             if isinstance(result, Exception):
-                self._errors.append(f"{name}: unhandled exception, {result}")
-                console.print(
-                    Text.assemble(
-                        ("  ✗ ", RED),
-                        (f"{name:<16}", WHITE),
-                        ("  error", DIM),
+                self._err(f"{name}: unhandled exception, {result}")
+                if not self.cfg.quiet:
+                    console.print(
+                        Text.assemble(
+                            ("  ✗ ", RED),
+                            (f"{name:<16}", WHITE),
+                            ("  error", DIM),
+                        )
                     )
-                )
                 continue
 
             count = 0
@@ -990,29 +1563,31 @@ class SubScanner:
 
             color = GREEN if count else DIMMER
             count_label = f"{count} results" if count else "0 results"
-            console.print(
-                Text.assemble(
-                    ("  ◉ " if count else "  ○ ", color),
-                    (f"{name:<16}", WHITE),
-                    ("  →  ", DIM),
-                    (count_label, CYAN if count else DIM),
+            if not self.cfg.quiet:
+                console.print(
+                    Text.assemble(
+                        ("  ◉ " if count else "  ○ ", color),
+                        (f"{name:<16}", WHITE),
+                        ("  →  ", DIM),
+                        (count_label, CYAN if count else DIM),
+                    )
                 )
-            )
 
         self._found = set(sub_sources.keys())
         dedup_count = len(self._found)
 
-        console.print()
-        console.print(
-            Text.assemble(
-                ("  total unique subdomains: ", DIM),
-                (str(dedup_count), f"bold {WHITE}"),
+        if not self.cfg.quiet:
+            console.print()
+            console.print(
+                Text.assemble(
+                    ("  total unique subdomains: ", DIM),
+                    (str(dedup_count), f"bold {WHITE}"),
+                )
             )
-        )
-        console.print()
+            console.print()
 
         # surface source errors right after enumeration
-        if self._errors:
+        if self._errors and not self.cfg.quiet:
             for e in self._errors:
                 console.print(Text(f"  ⚠  {e}", style=YELLOW))
             console.print()
@@ -1020,8 +1595,9 @@ class SubScanner:
 
         # phase 2: brute force (optional)
         if self.cfg.brute:
-            hr("Brute Force")
-            console.print()
+            if not self.cfg.quiet:
+                hr("Brute Force")
+                console.print()
 
             words: List[str] = list(WORDLIST)
             if self.cfg.wordlist and self.cfg.wordlist.exists():
@@ -1030,9 +1606,10 @@ class SubScanner:
                 ).splitlines()
                 words = list(set(words + [w.strip() for w in extra if w.strip()]))
 
-            console.print(
-                Text(f"  → trying {len(words):,} words against {domain}", style=DIM)
-            )
+            if not self.cfg.quiet:
+                console.print(
+                    Text(f"  → trying {len(words):,} words against {domain}", style=DIM)
+                )
             brute_results = await self._src_brute(domain, words)
 
             for sub, src in brute_results:
@@ -1043,13 +1620,14 @@ class SubScanner:
                     sub_sources[sub].append(src)
 
             self._found = set(sub_sources.keys())
-            console.print(
-                Text(
-                    f"  → found {len(brute_results)} new subdomains via brute force",
-                    style=DIM,
+            if not self.cfg.quiet:
+                console.print(
+                    Text(
+                        f"  → found {len(brute_results)} new subdomains via brute force",
+                        style=DIM,
+                    )
                 )
-            )
-            console.print()
+                console.print()
 
         subs_list = sorted(sub_sources.keys())
 
@@ -1057,7 +1635,7 @@ class SubScanner:
             return SubScanOut(
                 domain=domain,
                 subdomains=[],
-                total_found=self._total_raw,
+                total_found=dedup_count,
                 total_resolved=0,
                 started=started.isoformat(),
                 finished=datetime.now(timezone.utc).isoformat(),
@@ -1065,13 +1643,14 @@ class SubScanner:
                 errors=self._errors,
             )
 
-        # phase 3: parallel resolve + nmap + scrape
+        # phase 3: parallel resolve + port scan + scrape
         #
-        # each subdomain: resolve dns → nmap + scrape in parallel
+        # each subdomain: resolve dns → port scan + scrape in parallel
         # _resolve_sem and _nmap_sem prevent thundering-herd
 
-        hr("Resolve  ·  Nmap  ·  Scrape")
-        console.print()
+        if not self.cfg.quiet:
+            hr("Resolve  ·  Port Scan  ·  Scrape")
+            console.print()
 
         live_subs: List[SubInfo] = []
         prog = mk_prog(transient=False)
@@ -1079,9 +1658,18 @@ class SubScanner:
             f"Processing {len(subs_list)} subdomains", total=len(subs_list)
         )
 
+        live_console = console
+        if self.cfg.quiet:
+            live_console = Console(
+                file=io.StringIO(),
+                highlight=False,
+                force_terminal=False,
+                color_system=None,
+            )
+
         live = Live(
             build_live_panel(prog, live_subs, domain),
-            console=console,
+            console=live_console,
             refresh_per_second=8,
             transient=True,
         )
@@ -1095,16 +1683,26 @@ class SubScanner:
             all_results.append(info)
             ip_part = info.ip or "unresolved"
             src_part = ", ".join(info.sources[:2])
-            live.console.print(
-                Text.assemble(
-                    ("  ◉ ", GREEN),
-                    (f"{sub:<46}", f"bold {WHITE}"),
-                    ("  →  ", DIM),
-                    (ip_part, SVC_COL),
-                    ("  ", DIM),
-                    (f"[{src_part}]", DIMMER),
+            if not self.cfg.quiet:
+                live.console.print(
+                    Text.assemble(
+                        ("  ◉ ", GREEN),
+                        (f"{sub:<46}", f"bold {WHITE}"),
+                        ("  →  ", DIM),
+                        (ip_part, SVC_COL),
+                        ("  ", DIM),
+                        (f"[{src_part}]", DIMMER),
+                    )
                 )
-            )
+            if self.cfg.verbose > 0 and not self.cfg.quiet:
+                live.console.print(
+                    Text(
+                        f"      ports={','.join(str(p) for p in info.ports) or '-'}  "
+                        f"status={info.status or '-'}  "
+                        f"title={(info.title or '-')[:60]}",
+                        style=DIMMER,
+                    )
+                )
 
         live.start()
         try:
@@ -1129,7 +1727,7 @@ class SubScanner:
 
 def mk_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="async subdomain enumerator: passive sources + nmap + scraping",
+        description="async subdomain enumerator: passive sources + async port scans + scraping",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("domain", help="target apex domain  (e.g. example.com)")
@@ -1149,16 +1747,16 @@ def mk_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "-N",
+        "--no-port-scan",
         "--no-nmap",
+        dest="no_nmap",
         action="store_true",
-        help="skip nmap web port scan on resolved subdomains",
+        help="skip web port scanning on resolved subdomains",
     )
     p.add_argument(
         "-W", "--no-scrape", action="store_true", help="skip http page scraping"
     )
-    p.add_argument(
-        "-M", "--nmap-args", default="-T4", help="extra nmap arguments (default: -T4)"
-    )
+    p.add_argument("-M", "--nmap-args", default="", help=argparse.SUPPRESS)
     p.add_argument(
         "-c",
         "--resolve-concurrency",
@@ -1168,10 +1766,12 @@ def mk_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "-C",
+        "--scan-concurrency",
         "--nmap-concurrency",
+        dest="nmap_concurrency",
         type=int,
         default=30,
-        help="parallel nmap scan limit (default: 30)",
+        help="parallel per-host port scan limit (default: 30)",
     )
     p.add_argument(
         "-t",
@@ -1186,7 +1786,24 @@ def mk_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="show extra error detail and tracebacks",
     )
-    p.add_argument("-o", "--out", default=None, help="write json results to file")
+    p.add_argument(
+        "-o",
+        "--out",
+        default=None,
+        help="write results to file (.html default, .json/.csv by suffix)",
+    )
+    p.add_argument(
+        "-v",
+        action="count",
+        default=0,
+        help="show extra source/report detail",
+    )
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="suppress scan-time banners and progress chatter",
+    )
     return p
 
 
@@ -1200,19 +1817,13 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
     if not domain:
         console.print(Text("  ERROR  No domain specified.", style=RED))
         return 2
+    if args.quiet and args.v:
+        console.print(Text("  ERROR  Choose either -v or -q, not both.", style=RED))
+        return 2
 
     if args.resolve_concurrency < 1 or args.nmap_concurrency < 1:
         console.print(Text("  ERROR  Concurrency values must be >= 1.", style=RED))
         return 2
-
-    if not args.no_nmap and shutil.which("nmap") is None:
-        console.print(
-            Text(
-                "  WARNING  nmap not found in PATH, nmap scanning disabled.",
-                style=YELLOW,
-            )
-        )
-        args.no_nmap = True
 
     cfg = Cfg(
         domain=domain,
@@ -1221,17 +1832,20 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
         wordlist=args.wordlist,
         nmap_on=not args.no_nmap,
         scrape_on=not args.no_scrape,
-        n_args=shlex.split(args.nmap_args),
         resolve_c=args.resolve_concurrency,
         nmap_c=args.nmap_concurrency,
         http_to=args.http_timeout,
         debug=args.debug,
+        verbose=args.v,
+        quiet=args.quiet,
     )
 
-    hdr(domain, cfg)
+    if not args.quiet:
+        hdr(domain, cfg)
+    scanner = SubScanner(cfg)
 
     try:
-        result = asyncio.run(SubScanner(cfg).run())
+        result = asyncio.run(scanner.run())
     except KeyboardInterrupt:
         console.print()
         console.print(Text("  Interrupted.", style=YELLOW))
@@ -1244,6 +1858,8 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
         if args.debug:
             console.print(Text(traceback.format_exc(), style=DIMMER))
         return 1
+    finally:
+        scanner.close()
 
     show(result)
 
@@ -1254,10 +1870,19 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
             console.print(Text(f"  {e}", style=DIMMER))
         console.print()
 
-    if args.out and result.subdomains:
-        out_path = Path(args.out)
+    if args.out:
+        out_path, mode = _out_mode(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        if mode == "json":
+            out_path.write_text(
+                json.dumps(result.to_dict(), indent=2), encoding="utf-8"
+            )
+        elif mode == "csv":
+            out_path.write_text(_csv_sub(result), encoding="utf-8")
+        else:
+            out_path.write_text(build_html(result), encoding="utf-8")
+        if args.v:
+            console.print(Text(f"  output mode  {mode}  ->  {out_path}", style=DIMMER))
         t = Text()
         t.append("  Report saved  ", style=DIM)
         t.append(str(out_path), style=CYAN)
