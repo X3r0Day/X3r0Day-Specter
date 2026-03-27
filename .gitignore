@@ -49,6 +49,8 @@ todo.txt
 *.log
 results.json
 subdomains.json
+save
+save.html
 output/
 testsImpl.md
 temp/
