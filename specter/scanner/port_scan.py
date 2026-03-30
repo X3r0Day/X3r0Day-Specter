@@ -61,6 +61,8 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from ..core.results import ScanHit, SvcHit
+
 # output goes here
 console = Console(highlight=False)
 
@@ -102,7 +104,7 @@ HTTP_TITLE_MAX = 120
 SSH_BANNER_LIMIT = 256
 LIVE_REFRESH_INTERVAL = 0.10
 SVC_PROGRESS_POLL = 0.05
-LARGE_SCAN_PORT_THRESHOLD = 4096
+LARGE_SCAN_PORT_THRESHOLD = 512
 WEB_SVC_HINTS = ("http", "https", "proxy", "www", "web")
 
 HTTP_BLOCK_STATUSES = {403, 429, 503}
@@ -150,7 +152,7 @@ PORT2SVC: Dict[int, str] = {
     5432: "postgresql",
     6379: "redis",
     8080: "http-proxy",
-    # 8443: "https-alt",
+    8443: "https-alt",
 }
 
 
@@ -493,7 +495,7 @@ def grab_nmap_block(out: str, port: int) -> str:
 
 # scan configuration
 @dataclass
-class Cfg:
+class ScanCfg:
     target: str
     ports: List[int]
     c_conc: int
@@ -509,40 +511,9 @@ class Cfg:
     quiet: bool = False
 
 
-# result from service detection on one port
-@dataclass
-class SvcInfo:
-    port: int
-    ok: bool
-    state: str
-    svc: str
-    info: str
-    elapsed: float
-    n_cmd: str
-    raw: str
-    err: Optional[str]
-
-    def to_dict(self):
-        return self.__dict__
-
-
-# complete scan result for one target
-@dataclass
-class ScanOut:
-    target: str
-    ip: str
-    req_ports: List[int]
-    open_ports: List[int]
-    svcs: List[SvcInfo]
-    started: str
-    finished: str
-    elapsed: float
-    errors: List[str]
-
-    def to_dict(self):
-        d = dict(self.__dict__)
-        d["svcs"] = [s.to_dict() for s in self.svcs]
-        return d
+Cfg = ScanCfg
+SvcInfo = SvcHit
+ScanOut = ScanHit
 
 
 def hr(title: str = "") -> None:
@@ -614,12 +585,12 @@ def _tls_cert_bits(cert: Optional[Dict[str, object]]) -> List[str]:
     return bits
 
 
-def _probe_detail_panel(res: ScanOut, verbose: int) -> Optional[Panel]:
-    if verbose <= 0 or not res.svcs:
+def _probe_detail_panel(scan: ScanHit, verbose: int) -> Optional[Panel]:
+    if verbose <= 0 or not scan.svcs:
         return None
 
     lines: List[Text] = []
-    for svc in sorted(res.svcs, key=lambda item: item.port):
+    for svc in sorted(scan.svcs, key=lambda item: item.port):
         head = Text.assemble(
             (f"{svc.port:>5}/tcp", f"bold {WHITE}"),
             ("  ", DIM),
@@ -647,7 +618,7 @@ def _probe_detail_panel(res: ScanOut, verbose: int) -> Optional[Panel]:
     )
 
 
-def hdr(hosts: List[str], total_ports: int, cfg: Cfg) -> None:
+def hdr(hosts: List[str], total_ports: int, cfg: ScanCfg) -> None:
     """
     # Scan Header Banner
     # ------------------
@@ -763,7 +734,7 @@ def state_label(state: str) -> Text:
     return Text(label, style=style)
 
 
-def res_tbl(res: ScanOut) -> Table:
+def open_tbl(scan: ScanHit) -> Table:
     """
     # Results Table Format
     # --------------------
@@ -790,9 +761,9 @@ def res_tbl(res: ScanOut) -> Table:
     tbl.add_column("DETAILS", style=DETAIL, justify="left", min_width=30, max_width=55)
 
     # quick lookup: port -> service info
-    svc_map = {s.port: s for s in res.svcs}
+    svc_map = {s.port: s for s in scan.svcs}
 
-    for port in res.open_ports:
+    for port in scan.open_ports:
         sv = svc_map.get(port)
         svc = sv.svc if sv else "unknown"
         info = sv.info if sv else ""
@@ -810,7 +781,7 @@ def res_tbl(res: ScanOut) -> Table:
     return tbl
 
 
-def stats_tbl(res: ScanOut) -> Table:
+def sum_tbl(scan: ScanHit) -> Table:
     """
     # Scan Stats Grid
     # ---------------
@@ -818,14 +789,14 @@ def stats_tbl(res: ScanOut) -> Table:
     # Open       3  [0.0%]       Started   2026-03-27  14:30:00
     # Closed     65,532          Filtered  0         Finished   2026-03-27  14:30:12
     """
-    total = len(res.req_ports)
-    opened = len(res.open_ports)
-    filtered = getattr(res, "_filtered_count", 0)
-    closed = getattr(res, "_closed_count", max(total - opened - filtered, 0))
+    total = len(scan.req_ports)
+    opened = len(scan.open_ports)
+    filtered = getattr(scan, "_filtered_count", 0)
+    closed = getattr(scan, "_closed_count", max(total - opened - filtered, 0))
     pct = opened / total * 100 if total > 0 else 0.0
     # strip timezone and format timestamps
-    ts = res.started[:19].replace("T", "  ")
-    tf = res.finished[:19].replace("T", "  ")
+    ts = scan.started[:19].replace("T", "  ")
+    tf = scan.finished[:19].replace("T", "  ")
 
     grid = Table.grid(padding=(0, 4))
     grid.add_column(min_width=13, no_wrap=True)
@@ -846,13 +817,13 @@ def stats_tbl(res: ScanOut) -> Table:
         k("Scanned"),
         v(f"{total:,} ports"),
         k("Elapsed"),
-        v(f"{res.elapsed:.3f}s"),
+        v(f"{scan.elapsed:.3f}s"),
         k("Target"),
-        v(res.target),
+        v(scan.target),
     )
     # row 2: open count with %, start time, ip
     grid.add_row(
-        k("Open"), v(f"{opened}  [{pct:.1f}%]"), k("Started"), v(ts), k("IP"), v(res.ip)
+        k("Open"), v(f"{opened}  [{pct:.1f}%]"), k("Started"), v(ts), k("IP"), v(scan.ip)
     )
     # row 3: closed count, filtered count, finish time
     grid.add_row(
@@ -867,7 +838,7 @@ def stats_tbl(res: ScanOut) -> Table:
     return grid
 
 
-def show(res: ScanOut, idx: int = 0, total: int = 1, verbose: int = 0) -> None:
+def show_scan(scan: ScanHit, idx: int = 0, total: int = 1, verbose: int = 0) -> None:
     """
     # Output Flow
     # -----------
@@ -888,7 +859,7 @@ def show(res: ScanOut, idx: int = 0, total: int = 1, verbose: int = 0) -> None:
 
     # stats panel
     stats_panel = Panel(
-        Padding(stats_tbl(res), (0, 1)),
+        Padding(sum_tbl(scan), (0, 1)),
         title=f"[bold {WHITE}]Scan Summary[/bold {WHITE}]",
         border_style=BORDER,
         box=box.ROUNDED,
@@ -897,10 +868,10 @@ def show(res: ScanOut, idx: int = 0, total: int = 1, verbose: int = 0) -> None:
     console.print(stats_panel)
 
     # open ports table or "nothing found" message
-    if res.open_ports:
+    if scan.open_ports:
         results_panel = Panel(
-            Padding(res_tbl(res), (0, 1)),
-            title=f"[bold {WHITE}]Open Ports  •  {res.target}[/bold {WHITE}]",
+            Padding(open_tbl(scan), (0, 1)),
+            title=f"[bold {WHITE}]Open Ports  •  {scan.target}[/bold {WHITE}]",
             border_style=CYAN,
             box=box.ROUNDED,
             expand=True,
@@ -909,20 +880,20 @@ def show(res: ScanOut, idx: int = 0, total: int = 1, verbose: int = 0) -> None:
         msg = Text("No open ports discovered in selected range.", style=DIM)
         results_panel = Panel(
             Padding(msg, (0, 1)),
-            title=f"[bold {WHITE}]Open Ports  •  {res.target}[/bold {WHITE}]",
+            title=f"[bold {WHITE}]Open Ports  •  {scan.target}[/bold {WHITE}]",
             border_style=BORDER,
             box=box.ROUNDED,
             expand=True,
         )
 
     console.print(results_panel)
-    detail_panel = _probe_detail_panel(res, verbose)
+    detail_panel = _probe_detail_panel(scan, verbose)
     if detail_panel is not None:
         console.print(detail_panel)
     console.print()
 
 
-def multi_sum(results: List[ScanOut]) -> None:
+def show_multi_sum(runs: List[ScanHit]) -> None:
     """
     # Aggregate Summary Table
     # -----------------------
@@ -933,7 +904,7 @@ def multi_sum(results: List[ScanOut]) -> None:
     #                                      ─────────────────────────────
     #     TOTAL                                   8     1,124
     """
-    if len(results) < 2:
+    if len(runs) < 2:
         return
 
     console.print()
@@ -958,17 +929,17 @@ def multi_sum(results: List[ScanOut]) -> None:
     total_open = 0
     total_scanned = 0
 
-    for i, res in enumerate(results, 1):
-        n = len(res.open_ports)
+    for i, scan in enumerate(runs, 1):
+        n = len(scan.open_ports)
         total_open += n
-        total_scanned += len(res.req_ports)
+        total_scanned += len(scan.req_ports)
         tbl.add_row(
             str(i),
-            res.target,
-            res.ip,
+            scan.target,
+            scan.ip,
             Text(str(n), style=GREEN if n > 0 else DIM),
-            f"{len(res.req_ports):,}",
-            f"{res.elapsed:.3f}s",
+            f"{len(scan.req_ports):,}",
+            f"{scan.elapsed:.3f}s",
         )
 
     # totals row
@@ -1038,7 +1009,7 @@ def _out_mode(raw: str):
     return out, "html"
 
 
-def _csv_scan(results: List[ScanOut]) -> str:
+def _scan_csv(runs: List[ScanHit]) -> str:
     buf = io.StringIO()
     fields = [
         "target",
@@ -1062,20 +1033,20 @@ def _csv_scan(results: List[ScanOut]) -> str:
     writer = csv.DictWriter(buf, fieldnames=fields)
     writer.writeheader()
 
-    for res in results:
-        total = len(res.req_ports)
-        opened = len(res.open_ports)
-        filtered = getattr(res, "_filtered_count", 0)
-        closed = getattr(res, "_closed_count", max(total - opened - filtered, 0))
-        svc_map = {svc.port: svc for svc in res.svcs}
-        row_ports = res.open_ports or [0]
+    for scan in runs:
+        total = len(scan.req_ports)
+        opened = len(scan.open_ports)
+        filtered = getattr(scan, "_filtered_count", 0)
+        closed = getattr(scan, "_closed_count", max(total - opened - filtered, 0))
+        svc_map = {svc.port: svc for svc in scan.svcs}
+        row_ports = scan.open_ports or [0]
 
         for port in row_ports:
             svc = svc_map.get(port)
             writer.writerow(
                 {
-                    "target": res.target,
-                    "ip": res.ip,
+                    "target": scan.target,
+                    "ip": scan.ip,
                     "port": port or "",
                     "proto": "tcp" if port else "",
                     "state": svc.state if svc else "",
@@ -1084,9 +1055,9 @@ def _csv_scan(results: List[ScanOut]) -> str:
                     "probe_elapsed": f"{svc.elapsed:.3f}" if svc else "",
                     "probe_cmd": svc.n_cmd if svc else "",
                     "probe_error": svc.err if svc and svc.err else "",
-                    "scan_started": res.started,
-                    "scan_finished": res.finished,
-                    "scan_elapsed": f"{res.elapsed:.3f}",
+                    "scan_started": scan.started,
+                    "scan_finished": scan.finished,
+                    "scan_elapsed": f"{scan.elapsed:.3f}",
                     "scanned": total,
                     "open_count": opened,
                     "closed_count": closed,
@@ -1098,7 +1069,7 @@ def _csv_scan(results: List[ScanOut]) -> str:
 
 
 # build unified html report
-def build_html(results: List[ScanOut]) -> str:
+def build_scan_html(runs: List[ScanHit]) -> str:
     lines = [
         "<!DOCTYPE html>",
         "<html lang='en'>",
@@ -1183,19 +1154,19 @@ def build_html(results: List[ScanOut]) -> str:
         "<body>",
         "  <div class='wrap'>",
         "    <h1>Port Scan Report</h1>",
-        f"    <p class='meta'>X3R0DAY Specter &middot; {len(results)} target(s) &middot; {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>",
+        f"    <p class='meta'>X3R0DAY Specter &middot; {len(runs)} target(s) &middot; {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>",
     ]
 
-    for res in results:
-        total = len(res.req_ports)
-        opened = len(res.open_ports)
-        filtered = getattr(res, "_filtered_count", 0)
-        closed = getattr(res, "_closed_count", max(total - opened - filtered, 0))
+    for scan in runs:
+        total = len(scan.req_ports)
+        opened = len(scan.open_ports)
+        filtered = getattr(scan, "_filtered_count", 0)
+        closed = getattr(scan, "_closed_count", max(total - opened - filtered, 0))
 
         lines.append("    <hr>")
         lines.append("    <div class='target'>")
-        lines.append(f"      <div class='target-name'>{html.escape(res.target)}</div>")
-        lines.append(f"      <div class='target-ip'>{html.escape(res.ip)}</div>")
+        lines.append(f"      <div class='target-name'>{html.escape(scan.target)}</div>")
+        lines.append(f"      <div class='target-ip'>{html.escape(scan.ip)}</div>")
         lines.append("    </div>")
 
         lines.append("    <div class='stats'>")
@@ -1203,18 +1174,18 @@ def build_html(results: List[ScanOut]) -> str:
         lines.append(f"      <span class='open'>Open<strong>{opened}</strong></span>")
         lines.append(f"      <span>Closed<strong>{closed}</strong></span>")
         lines.append(f"      <span>Filtered<strong>{filtered}</strong></span>")
-        lines.append(f"      <span>{res.elapsed:.2f}s</span>")
+        lines.append(f"      <span>{scan.elapsed:.2f}s</span>")
         lines.append("    </div>")
 
-        if res.open_ports:
-            svc_map = {s.port: s for s in res.svcs}
+        if scan.open_ports:
+            svc_map = {s.port: s for s in scan.svcs}
             lines.append("    <table>")
             lines.append(
                 "      <thead><tr><th style='width:70px'>Port</th><th style='width:60px'>State</th><th style='width:120px'>Service</th><th>Info</th></tr></thead>"
             )
             lines.append("      <tbody>")
 
-            for port in res.open_ports:
+            for port in scan.open_ports:
                 sv = svc_map.get(port)
                 svc = sv.svc if sv else "unknown"
                 info_short = _clean_text(sv.info, 80) if sv and sv.info else ""
@@ -1386,26 +1357,14 @@ class Scanner:
     def __init__(self, cfg: Cfg):
         self.cfg = cfg
         self._s_sem = asyncio.Semaphore(cfg.s_conc)
-        self._svc_tasks: List[asyncio.Task] = []
-        self._svc_results: Dict[int, SvcInfo] = {}
-        self._svc_scheduled: Set[int] = set()
-        self._svcs: List[SvcInfo] = []
         self._lock = asyncio.Lock()
-        self._st = {p: "pending" for p in cfg.ports}
-        self._tested = 0
-        self._open = 0
-        self._closed = 0
-        self._filtered = 0
-        self._svc_started = 0
-        self._svc_done = 0
-        self._svc_failed = 0
-        self._open_ports: List[int] = []
-        self._live_next_refresh = 0.0
         self._http_probe_blocked = False
         self._target_is_ip = self._is_ip_literal(cfg.target)
         self._raw_sock = None
         self._src_ip = None
         self._resolved_ip: Optional[str] = None
+        self._resolved_candidates: List[str] = []
+        self._reset_scan_state()
 
         # SYN scan receiver state
         self._syn_receiver_task: Optional[asyncio.Task] = None
@@ -1443,6 +1402,22 @@ class Scanner:
                 # Will be caught during validation
                 pass
 
+    def _reset_scan_state(self):
+        self._svc_tasks = []
+        self._svc_results = {}
+        self._svc_scheduled = set()
+        self._svcs = []
+        self._st = {p: "pending" for p in self.cfg.ports}
+        self._tested = 0
+        self._open = 0
+        self._closed = 0
+        self._filtered = 0
+        self._svc_started = 0
+        self._svc_done = 0
+        self._svc_failed = 0
+        self._open_ports = []
+        self._live_next_refresh = 0.0
+
     # mark port as started service scan
     async def _mark_svc_start(self, port: int):
         async with self._lock:
@@ -1456,6 +1431,22 @@ class Scanner:
             self._st[port] = "done" if ok else "failed"
             if not ok:
                 self._svc_failed += 1
+
+    async def _mark_svc_batch_start(self, ports: List[int]):
+        async with self._lock:
+            for port in ports:
+                self._svc_started += 1
+                self._st[port] = "scanning"
+
+    async def _mark_svc_batch_done(self, results: Dict[int, SvcInfo], ports: List[int]):
+        async with self._lock:
+            for port in ports:
+                res = results.get(port)
+                ok = True if res is None else res.ok
+                self._svc_done += 1
+                self._st[port] = "done" if ok else "failed"
+                if not ok:
+                    self._svc_failed += 1
 
     def _is_ip_literal(self, host: str) -> bool:
         try:
@@ -1479,30 +1470,48 @@ class Scanner:
                 "max_window": max(1, min(self.cfg.c_conc, 192)),
                 "min_window": max(1, min(self.cfg.c_conc, 24)),
                 "increase": 4,
-                "max_retries": 0,
-                "timeout_floor": min(self.cfg.c_to, 0.25),
+                "max_retries": 1,
+                "retry_budget": max(8, min(port_count // 8, 64)),
+                "timeout_floor": min(self.cfg.c_to, 0.50),
             }
 
-        if port_count >= LARGE_SCAN_PORT_THRESHOLD:
-            start_window = max(1, min(self.cfg.c_conc, 1024))
-            max_window = max(start_window, min(self.cfg.c_conc, 2048))
-            min_window = max(64, min(start_window, 256))
+        if port_count >= 32768:
+            start_window = max(1, min(self.cfg.c_conc, 512))
+            max_window = max(start_window, self.cfg.c_conc)
+            min_window = max(128, min(start_window, 256))
             return {
                 "window": start_window,
                 "max_window": max_window,
                 "min_window": min_window,
                 "increase": 32,
                 "max_retries": 1,
-                "timeout_floor": min(self.cfg.c_to, 0.35),
+                "retry_budget": max(64, min(port_count // 32, 1024)),
+                "timeout_floor": min(self.cfg.c_to, 0.75),
             }
 
+        if port_count >= LARGE_SCAN_PORT_THRESHOLD:
+            start_window = max(1, min(self.cfg.c_conc, max(256, min(port_count, 768))))
+            max_window = max(start_window, self.cfg.c_conc)
+            min_window = max(96, min(start_window, 256))
+            return {
+                "window": start_window,
+                "max_window": max_window,
+                "min_window": min_window,
+                "increase": 32,
+                "max_retries": 1,
+                "retry_budget": max(32, min(port_count // 16, 256)),
+                "timeout_floor": min(self.cfg.c_to, 0.50),
+            }
+
+        start_window = max(1, min(self.cfg.c_conc, max(128, min(port_count, 512))))
         return {
-            "window": max(1, min(self.cfg.c_conc, 256)),
-            "max_window": max(1, self.cfg.c_conc),
-            "min_window": max(1, min(self.cfg.c_conc, 32)),
-            "increase": 8,
+            "window": start_window,
+            "max_window": max(start_window, self.cfg.c_conc),
+            "min_window": max(64, min(start_window, 256)),
+            "increase": 16,
             "max_retries": 1,
-            "timeout_floor": min(self.cfg.c_to, 0.10),
+            "retry_budget": max(8, min(port_count // 4, 64)),
+            "timeout_floor": min(self.cfg.c_to, 0.35),
         }
 
     async def _maybe_refresh_live(
@@ -1545,7 +1554,9 @@ class Scanner:
                 self._open_ports.append(port)
                 live_ports.append(port)
                 announce_open = True
-                queue_svc = self.cfg.svc_on
+                # Basic probes can overlap discovery, but aggressive nmap
+                # service detection is faster when batched after discovery.
+                queue_svc = self.cfg.svc_on and not self.cfg.aggr_on
             elif state == "filtered":
                 self._filtered += 1
             else:
@@ -1698,6 +1709,11 @@ class Scanner:
         async with self._lock:
             self._svc_results[res.port] = res
 
+    async def _store_svc_batch_results(self, results: List[SvcInfo]):
+        async with self._lock:
+            for res in results:
+                self._svc_results[res.port] = res
+
     async def _queue_service_detection(self, port: int):
         if not self.cfg.svc_on or self._resolved_ip is None:
             return
@@ -1707,14 +1723,24 @@ class Scanner:
                 return
 
             self._svc_scheduled.add(port)
-            if self.cfg.aggr_on:
-                task = asyncio.create_task(
-                    self._svc_worker_aggressive(self.cfg.target, port)
-                )
-            else:
-                task = asyncio.create_task(
-                    self._svc_worker_basic(self._resolved_ip, port)
-                )
+            task = asyncio.create_task(self._svc_worker_basic(self._resolved_ip, port))
+            self._svc_tasks.append(task)
+
+    async def _queue_service_detection_batch(
+        self, host: str, ports: List[int]
+    ) -> None:
+        if not self.cfg.svc_on or self._resolved_ip is None or not ports:
+            return
+
+        async with self._lock:
+            batch_ports = [port for port in ports if port not in self._svc_scheduled]
+            if not batch_ports:
+                return
+
+            self._svc_scheduled.update(batch_ports)
+            task = asyncio.create_task(
+                self._svc_worker_aggressive_batch(host, sorted(batch_ports))
+            )
             self._svc_tasks.append(task)
 
     async def _svc_worker_basic(self, ip: str, port: int):
@@ -1737,26 +1763,31 @@ class Scanner:
         await self._store_svc_result(res)
         await self._mark_svc_done(port, res.ok)
 
-    async def _svc_worker_aggressive(self, host: str, port: int):
-        await self._mark_svc_start(port)
+    async def _svc_worker_aggressive_batch(self, host: str, ports: List[int]):
+        await self._mark_svc_batch_start(ports)
         try:
             async with self._s_sem:
-                results = await self._nmap_batch(host, [port])
-            res = results[0]
+                results = await self._nmap_batch(host, ports)
         except Exception as err:
-            res = SvcInfo(
-                port=port,
-                ok=True,
-                state="open",
-                svc=guess_svc(port),
-                info=f"nmap service scan failed: {str(err)[:60]}",
-                elapsed=0.0,
-                n_cmd="",
-                raw="",
-                err=str(err),
-            )
-        await self._store_svc_result(res)
-        await self._mark_svc_done(port, res.ok)
+            msg = f"nmap service scan failed: {str(err)[:60]}"
+            results = [
+                SvcInfo(
+                    port=port,
+                    ok=True,
+                    state="open",
+                    svc=guess_svc(port),
+                    info=msg,
+                    elapsed=0.0,
+                    n_cmd="",
+                    raw="",
+                    err=str(err),
+                )
+                for port in ports
+            ]
+
+        by_port = {res.port: res for res in results}
+        await self._store_svc_batch_results(results)
+        await self._mark_svc_batch_done(by_port, ports)
 
     async def _nmap_discover(
         self,
@@ -1822,7 +1853,7 @@ class Scanner:
 
         await self._maybe_refresh_live(live, prog, live_ports, force=True)
 
-        if self.cfg.svc_on:
+        if self.cfg.svc_on and not self.cfg.aggr_on:
             for port in open_ports:
                 await self._queue_service_detection(port)
 
@@ -2180,9 +2211,30 @@ class Scanner:
                 infos = await loop.getaddrinfo(
                     host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
                 )
+                seen = set()
+                v4: List[str] = []
+                v6: List[str] = []
+
                 for family, _socktype, _proto, _canon, sockaddr in infos:
-                    if family in {socket.AF_INET, socket.AF_INET6}:
-                        return sockaddr[0], family
+                    if family not in {socket.AF_INET, socket.AF_INET6}:
+                        continue
+
+                    addr = sockaddr[0]
+                    if addr in seen:
+                        continue
+
+                    seen.add(addr)
+                    if family == socket.AF_INET:
+                        v4.append(addr)
+                    else:
+                        v6.append(addr)
+
+                ordered = v4 + v6
+                if ordered:
+                    self._resolved_candidates = ordered
+                    if v4:
+                        return v4[0], socket.AF_INET
+                    return v6[0], socket.AF_INET6
                 raise RuntimeError(f"no supported address family for {host}")
             except Exception as err:
                 last_err = err
@@ -2205,6 +2257,7 @@ class Scanner:
         pending = deque(ports)
         retries: Dict[int, int] = {}
         profile = self._scan_profile()
+        retry_budget = int(profile.get("retry_budget", 0))
         dyn_timeout = self.cfg.c_to
         srtt = 0.0
         rttvar = 0.0
@@ -2257,7 +2310,7 @@ class Scanner:
                 except Exception:
                     events = []
 
-                saw_timeout = False
+                requeued_timeout = False
                 for fd, event in events:
                     entry = sockets.pop(fd, None)
                     if entry is None:
@@ -2303,8 +2356,8 @@ class Scanner:
                     if now - started_at > dyn_timeout:
                         expired.append((fd, sock, port))
 
+                expired_count = len(expired)
                 for fd, sock, port in expired:
-                    saw_timeout = True
                     try:
                         epoll.unregister(fd)
                     except Exception:
@@ -2313,7 +2366,9 @@ class Scanner:
                     del sockets[fd]
 
                     retry_count = retries.get(port, 0)
-                    if retry_count < profile["max_retries"]:
+                    if retry_count < profile["max_retries"] and retry_budget > 0:
+                        requeued_timeout = True
+                        retry_budget -= 1
                         retries[port] = retry_count + 1
                         self._st[port] = "retrying"
                         pending.appendleft(port)
@@ -2322,7 +2377,19 @@ class Scanner:
                             port, "filtered", prog, tid, live_ports, live
                         )
 
-                if saw_timeout:
+                if expired_count:
+                    timeout_ratio = expired_count / max(1, expired_count + len(events))
+                    if expired_count >= 4 and (
+                        timeout_ratio >= 0.20
+                        or expired_count >= max(8, window_size // 8)
+                    ):
+                        window_size = max(profile["min_window"], window_size // 2)
+                        dyn_timeout = min(self.cfg.c_to, max(dyn_timeout, min_timeout))
+                        if self.cfg.stealth:
+                            scan_delay = min(
+                                0.08, 0.01 if scan_delay == 0.0 else scan_delay * 2
+                            )
+                elif requeued_timeout:
                     window_size = max(profile["min_window"], window_size // 2)
                     if self.cfg.stealth:
                         scan_delay = min(
@@ -2538,6 +2605,7 @@ class Scanner:
         inflight: Dict[int, tuple] = {}
         retries: Dict[int, int] = {}
         profile = self._scan_profile()
+        retry_budget = int(profile.get("retry_budget", 0))
         dyn_timeout = self.cfg.c_to
         srtt = 0.0
         rttvar = 0.0
@@ -2635,13 +2703,15 @@ class Scanner:
                     if now - started_at > dyn_timeout:
                         expired.append((src_port, port))
 
-                saw_timeout = False
+                expired_count = len(expired)
+                requeued_timeout = False
                 for src_port, port in expired:
-                    saw_timeout = True
                     inflight.pop(src_port, None)
 
                     retry_count = retries.get(port, 0)
-                    if retry_count < profile["max_retries"]:
+                    if retry_count < profile["max_retries"] and retry_budget > 0:
+                        requeued_timeout = True
+                        retry_budget -= 1
                         retries[port] = retry_count + 1
                         self._st[port] = "retrying"
                         pending.appendleft(port)
@@ -2650,7 +2720,21 @@ class Scanner:
                             port, "filtered", prog, tid, live_ports, live
                         )
 
-                if saw_timeout:
+                if expired_count:
+                    timeout_ratio = expired_count / max(
+                        1, expired_count + (1 if got_response else 0)
+                    )
+                    if expired_count >= 4 and (
+                        timeout_ratio >= 0.20
+                        or expired_count >= max(8, window_size // 8)
+                    ):
+                        window_size = max(profile["min_window"], window_size // 2)
+                        dyn_timeout = min(self.cfg.c_to, max(dyn_timeout, min_timeout))
+                        if self.cfg.stealth:
+                            scan_delay = min(
+                                0.08, 0.01 if scan_delay == 0.0 else scan_delay * 2
+                            )
+                elif requeued_timeout:
                     window_size = max(profile["min_window"], window_size // 2)
                     if self.cfg.stealth:
                         scan_delay = min(
@@ -2686,12 +2770,13 @@ class Scanner:
         srtt = 0.0
         rttvar = 0.0
         min_timeout = float(profile.get("timeout_floor", 0.10))
+        retry_budget = int(profile.get("retry_budget", 0))
         dyn_sem = DynamicSemaphore(profile["window"])
         dyn_sem.max_value = profile["max_window"]
         scan_delay = 0.0
 
         async def scan_port(port: int):
-            nonlocal dyn_timeout, srtt, rttvar, scan_delay
+            nonlocal dyn_timeout, srtt, rttvar, scan_delay, retry_budget
             retries = 0
 
             while True:
@@ -2730,14 +2815,18 @@ class Scanner:
                     break
 
                 retries += 1
-                await dyn_sem.set_value(max(profile["min_window"], dyn_sem.value // 2))
-
-                if retries > profile["max_retries"]:
+                should_retry = retries <= profile["max_retries"] and retry_budget > 0
+                if not should_retry:
+                    await dyn_sem.set_value(
+                        max(profile["min_window"], dyn_sem.value // 2)
+                    )
                     await self._finish_port(
                         port, "filtered", prog, tid, live_ports, live
                     )
                     break
 
+                retry_budget -= 1
+                await dyn_sem.set_value(max(profile["min_window"], dyn_sem.value // 2))
                 self._st[port] = "retrying"
                 if self.cfg.stealth:
                     scan_delay = min(
@@ -2771,8 +2860,11 @@ class Scanner:
             ]
             return
 
-        for port in self._open_ports:
-            await self._queue_service_detection(port)
+        if self.cfg.aggr_on:
+            await self._queue_service_detection_batch(ip, self._open_ports)
+        else:
+            for port in self._open_ports:
+                await self._queue_service_detection(port)
 
         waiters: List[asyncio.Future] = list(self._svc_tasks)
 
@@ -2835,6 +2927,18 @@ class Scanner:
         ports = self._ordered_ports()
         errors: List[str] = []
 
+        if len(self._resolved_candidates) > 1:
+            errors.append(
+                f"hostname resolved to {len(self._resolved_candidates)} addresses; scanning {ip}"
+            )
+            if not self.cfg.quiet:
+                console.print(
+                    Text(
+                        f"  note  {self.cfg.target} resolved to {len(self._resolved_candidates)} addresses; scanning {ip}",
+                        style=DIM,
+                    )
+                )
+
         live_ports: List[int] = []
         prog = mk_prog(transient=False)
         tid = prog.add_task(f"Scanning {self.cfg.target}", total=len(ports))
@@ -2862,12 +2966,7 @@ class Scanner:
                 )
                 if err:
                     errors.append(f"hybrid discovery fallback: {err}")
-                    self._tested = 0
-                    self._open = 0
-                    self._closed = 0
-                    self._filtered = 0
-                    self._open_ports = []
-                    self._st = {p: "pending" for p in self.cfg.ports}
+                    self._reset_scan_state()
                     live_ports.clear()
                     prog.update(tid, completed=0)
                     await self._maybe_refresh_live(live, prog, live_ports, force=True)
@@ -2979,8 +3078,9 @@ async def scan_quiet(
 
 
 # build argument parser
-def mk_parser() -> argparse.ArgumentParser:
+def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
+        prog=prog,
         description="async tcp port scanner with realtime per-port service detection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -3026,7 +3126,10 @@ def mk_parser() -> argparse.ArgumentParser:
         help="aggressive nmap service scan (-sV -A) on open ports",
     )
     p.add_argument(
-        "-M", "--nmap-args", default="-sV --open", help="extra nmap args for -S mode"
+        "-M",
+        "--nmap-args",
+        default="-sV --open",
+        help="extra nmap args for -S mode",
     )
     p.add_argument(
         "-U",
@@ -3078,9 +3181,9 @@ def mk_parser() -> argparse.ArgumentParser:
 
 
 # main entry point
-def run_cli(argv: Optional[List[str]] = None) -> int:
+def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int:
     os.environ["PYTHONUNBUFFERED"] = "1"
-    parser = mk_parser()
+    parser = build_parser(prog=prog)
     args = parser.parse_args(argv)
 
     targets = [t.strip() for t in args.target if t.strip()]
@@ -3180,15 +3283,16 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
         return 2
 
     use_nmap_service_detection = args.aggr_svc_scan or args.sudo_nmap
+    parsed_n_args = shlex.split(args.nmap_args)
 
     # show header
-    dummy_cfg = Cfg(
+    scan_cfg = Cfg(
         target="",
         ports=sel,
         c_conc=args.concurrency,
         c_to=args.timeout,
         s_conc=args.svc_concurrency,
-        n_args=shlex.split(args.nmap_args),
+        n_args=parsed_n_args,
         svc_on=not args.no_svc_scan,
         aggr_on=use_nmap_service_detection,
         sudo_pw=sudo_pw,
@@ -3198,10 +3302,10 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
         quiet=args.quiet,
     )
     if not args.quiet:
-        hdr(targets, len(sel), dummy_cfg)
+        hdr(targets, len(sel), scan_cfg)
 
     # scan each target
-    results: List[ScanOut] = []
+    runs: List[ScanHit] = []
     for target in targets:
         cfg = Cfg(
             target=target,
@@ -3209,7 +3313,7 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
             c_conc=args.concurrency,
             c_to=args.timeout,
             s_conc=args.svc_concurrency,
-            n_args=shlex.split(args.nmap_args),
+            n_args=parsed_n_args,
             svc_on=not args.no_svc_scan,
             aggr_on=use_nmap_service_detection,
             sudo_pw=sudo_pw,
@@ -3219,35 +3323,35 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
             quiet=args.quiet,
         )
         try:
-            res = asyncio.run(Scanner(cfg).run())
+            scan = asyncio.run(Scanner(cfg).run())
         except Exception as err:
             t = Text()
             t.append("  ERROR  ", style=f"bold {RED}")
             t.append(f"{target}: {err}", style=DIM)
             console.print(t)
             continue
-        results.append(res)
-        show(res, idx=len(results) - 1, total=len(targets), verbose=args.v)
+        runs.append(scan)
+        show_scan(scan, idx=len(runs) - 1, total=len(targets), verbose=args.v)
 
     # show multi-target summary
-    multi_sum(results)
+    show_multi_sum(runs)
 
     # write json or html output
-    if args.out and results:
+    if args.out and runs:
         out_path, mode = _out_mode(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         if mode == "json":
             payload = (
-                [r.to_dict() for r in results]
-                if len(results) > 1
-                else results[0].to_dict()
+                [scan.to_dict() for scan in runs]
+                if len(runs) > 1
+                else runs[0].to_dict()
             )
             out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         elif mode == "csv":
-            out_path.write_text(_csv_scan(results), encoding="utf-8")
+            out_path.write_text(_scan_csv(runs), encoding="utf-8")
         else:
-            out_path.write_text(build_html(results), encoding="utf-8")
+            out_path.write_text(build_scan_html(runs), encoding="utf-8")
 
         if args.v:
             console.print(Text(f"  output mode  {mode}  ->  {out_path}", style=DIMMER))
@@ -3258,6 +3362,16 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
         console.print()
 
     return 0
+
+
+# compatibility aliases
+res_tbl = open_tbl
+stats_tbl = sum_tbl
+show = show_scan
+multi_sum = show_multi_sum
+_csv_scan = _scan_csv
+build_html = build_scan_html
+mk_parser = build_parser
 
 
 def main():

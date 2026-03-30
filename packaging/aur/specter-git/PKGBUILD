@@ -1,0 +1,52 @@
+# Maintainer: X3r0Day
+
+pkgname=specter-git
+pkgver=0.1.0.r0.g0000000
+pkgrel=1
+pkgdesc="Subdomain enumeration and TCP port scanning toolkit"
+arch=("any")
+url="https://github.com/x3r0day/x3r0day-specter"
+license=("MIT")
+depends=("python" "python-rich")
+makedepends=(
+  "git"
+  "python-build"
+  "python-installer"
+  "python-setuptools"
+  "python-wheel"
+)
+optdepends=(
+  "nmap: aggressive service detection (-S) and sudo nmap mode (-U)"
+)
+provides=("specter")
+conflicts=("specter")
+source=("git+$url.git")
+sha256sums=("SKIP")
+
+pkgver() {
+  cd "$srcdir/x3r0day-specter"
+
+  local tag count hash
+  if tag="$(git describe --tags --abbrev=0 2>/dev/null)"; then
+    count="$(git rev-list --count "${tag}"..HEAD)"
+    hash="$(git rev-parse --short=7 HEAD)"
+    printf "%s.r%s.g%s\n" "${tag#v}" "$count" "$hash"
+    return
+  fi
+
+  count="$(git rev-list --count HEAD)"
+  hash="$(git rev-parse --short=7 HEAD)"
+  printf "0.0.0.r%s.g%s\n" "$count" "$hash"
+}
+
+build() {
+  cd "$srcdir/x3r0day-specter"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "$srcdir/x3r0day-specter"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

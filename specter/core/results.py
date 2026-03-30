@@ -1,5 +1,5 @@
 """
-dataclasses for port scan and service detection results
+shared result models for scans and service hits
 """
 
 from dataclasses import dataclass
@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 
 @dataclass
-class SvcInfo:
+class SvcHit:
     port: int
     ok: bool
     state: str
@@ -33,12 +33,12 @@ class SvcInfo:
 
 
 @dataclass
-class ScanOut:
+class ScanHit:
     target: str
     ip: str
     req_ports: List[int]
     open_ports: List[int]
-    svcs: List[SvcInfo]
+    svcs: List[SvcHit]
     started: str
     finished: str
     elapsed: float
@@ -56,3 +56,10 @@ class ScanOut:
             "elapsed_sec": self.elapsed,
             "errors": self.errors,
         }
+
+
+# compatibility aliases for older imports
+SvcInfo = SvcHit
+ScanOut = ScanHit
+
+__all__ = ["SvcHit", "ScanHit", "SvcInfo", "ScanOut"]

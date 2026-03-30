@@ -509,7 +509,7 @@ class _Dns:
 
 # result from resolving + scanning one subdomain
 @dataclass
-class SubInfo:
+class SubHit:
     subdomain: str
     ip: str  # resolved ipv4/v6, empty string if no dns
     sources: List[str]  # which sources found this subdomain
@@ -527,9 +527,9 @@ class SubInfo:
 
 # complete enumeration result for one domain
 @dataclass
-class SubScanOut:
+class SubRun:
     domain: str
-    subdomains: List[SubInfo]
+    subdomains: List[SubHit]
     total_found: int
     total_resolved: int
     started: str
@@ -545,7 +545,7 @@ class SubScanOut:
 
 # scan config passed into SubScanner
 @dataclass
-class Cfg:
+class SubCfg:
     domain: str
     shodan_key: Optional[str]
     brute: bool
@@ -560,6 +560,11 @@ class Cfg:
     quiet: bool = False
 
 
+SubInfo = SubHit
+SubScanOut = SubRun
+Cfg = SubCfg
+
+
 def hr(title: str = "") -> None:
     if title:
         console.print(
@@ -569,7 +574,7 @@ def hr(title: str = "") -> None:
         console.print(Rule(style=BORDER))
 
 
-def hdr(domain: str, cfg: Cfg) -> None:
+def hdr(domain: str, cfg: SubCfg) -> None:
     console.print()
     hr()
 
@@ -640,7 +645,7 @@ def mk_prog(transient: bool = True) -> Progress:
     )
 
 
-def live_disc_tbl(subs: List[SubInfo], domain: str) -> Table:
+def live_disc_tbl(subs: List[SubHit], domain: str) -> Table:
     tbl = Table(
         box=box.ROUNDED,
         show_header=True,
@@ -664,7 +669,7 @@ def live_disc_tbl(subs: List[SubInfo], domain: str) -> Table:
     return tbl
 
 
-def build_live_panel(progress: Progress, subs: List[SubInfo], domain: str) -> Group:
+def build_live_panel(progress: Progress, subs: List[SubHit], domain: str) -> Group:
     parts: List[Any] = [progress]
     if subs:
         parts.append(Text(""))
@@ -695,7 +700,7 @@ def _fmt_display_ts(raw: str) -> str:
     return dt.strftime("%Y-%m-%d  %H:%M:%S")
 
 
-def res_tbl(res: SubScanOut) -> Table:
+def sub_tbl(run: SubRun) -> Table:
     tbl = Table(
         box=box.SIMPLE_HEAD,
         show_header=True,
@@ -712,7 +717,7 @@ def res_tbl(res: SubScanOut) -> Table:
     tbl.add_column("TITLE", style=DETAIL, justify="left", min_width=28, max_width=46)
     tbl.add_column("SERVER", style=DIM, justify="left", min_width=12, max_width=20)
 
-    for s in res.subdomains:
+    for s in run.subdomains:
         ports_str = ", ".join(str(p) for p in s.ports) if s.ports else "-"
         st_style, st_val = _status_style(s.status)
         title = s.title.strip()
@@ -737,13 +742,13 @@ stats grid: found / resolved / unresolved counts, elapsed, timestamps
 """
 
 
-def stats_tbl(res: SubScanOut) -> Table:
-    total = res.total_found
-    resolved = res.total_resolved
+def sum_tbl(run: SubRun) -> Table:
+    total = run.total_found
+    resolved = run.total_resolved
     unres = total - resolved
-    with_web = sum(1 for s in res.subdomains if s.ports)
-    ts = _fmt_display_ts(res.started)
-    tf = _fmt_display_ts(res.finished)
+    with_web = sum(1 for s in run.subdomains if s.ports)
+    ts = _fmt_display_ts(run.started)
+    tf = _fmt_display_ts(run.finished)
 
     grid = Table.grid(padding=(0, 4))
     grid.add_column(min_width=13, no_wrap=True)
@@ -763,9 +768,9 @@ def stats_tbl(res: SubScanOut) -> Table:
         k("Found"),
         v(f"{total:,} subdomains"),
         k("Elapsed"),
-        v(f"{res.elapsed:.3f}s"),
+        v(f"{run.elapsed:.3f}s"),
         k("Domain"),
-        v(res.domain),
+        v(run.domain),
     )
     grid.add_row(
         k("Resolved"),
@@ -780,12 +785,12 @@ def stats_tbl(res: SubScanOut) -> Table:
     return grid
 
 
-def show(res: SubScanOut) -> None:
+def show_run(run: SubRun) -> None:
     console.print()
 
     console.print(
         Panel(
-            Padding(stats_tbl(res), (0, 1)),
+            Padding(sum_tbl(run), (0, 1)),
             title=f"[bold {WHITE}]Scan Summary[/bold {WHITE}]",
             border_style=BORDER,
             box=box.ROUNDED,
@@ -793,11 +798,11 @@ def show(res: SubScanOut) -> None:
         )
     )
 
-    if res.subdomains:
+    if run.subdomains:
         console.print(
             Panel(
-                Padding(res_tbl(res), (0, 1)),
-                title=f"[bold {WHITE}]Subdomains  •  {res.domain}[/bold {WHITE}]",
+                Padding(sub_tbl(run), (0, 1)),
+                title=f"[bold {WHITE}]Subdomains  •  {run.domain}[/bold {WHITE}]",
                 border_style=CYAN,
                 box=box.ROUNDED,
                 expand=True,
@@ -807,7 +812,7 @@ def show(res: SubScanOut) -> None:
         console.print(
             Panel(
                 Padding(Text("No subdomains discovered.", style=DIM), (0, 1)),
-                title=f"[bold {WHITE}]Subdomains  •  {res.domain}[/bold {WHITE}]",
+                title=f"[bold {WHITE}]Subdomains  •  {run.domain}[/bold {WHITE}]",
                 border_style=BORDER,
                 box=box.ROUNDED,
                 expand=True,
@@ -831,7 +836,7 @@ def _out_mode(raw: str):
     return out, "html"
 
 
-def _csv_sub(res: SubScanOut) -> str:
+def _sub_csv(run: SubRun) -> str:
     buf = io.StringIO()
     fields = [
         "domain",
@@ -849,8 +854,8 @@ def _csv_sub(res: SubScanOut) -> str:
     wr = csv.DictWriter(buf, fieldnames=fields)
     wr.writeheader()
 
-    rows = res.subdomains or [
-        SubInfo(
+    rows = run.subdomains or [
+        SubHit(
             subdomain="",
             ip="",
             sources=[],
@@ -866,7 +871,7 @@ def _csv_sub(res: SubScanOut) -> str:
     for sub in rows:
         wr.writerow(
             {
-                "domain": res.domain,
+                "domain": run.domain,
                 "subdomain": sub.subdomain,
                 "ip": sub.ip,
                 "sources": "|".join(sub.sources),
@@ -883,10 +888,10 @@ def _csv_sub(res: SubScanOut) -> str:
     return buf.getvalue()
 
 
-def build_html(res: SubScanOut) -> str:
-    found = res.total_found
-    resolved = res.total_resolved
-    web_hits = sum(1 for s in res.subdomains if s.ports)
+def build_sub_html(run: SubRun) -> str:
+    found = run.total_found
+    resolved = run.total_resolved
+    web_hits = sum(1 for s in run.subdomains if s.ports)
     lines = [
         "<!DOCTYPE html>",
         "<html lang='en'>",
@@ -978,7 +983,7 @@ def build_html(res: SubScanOut) -> str:
 
     lines.append("    <hr>")
     lines.append("    <div class='domain'>")
-    lines.append(f"      <div class='domain-name'>{html.escape(res.domain)}</div>")
+    lines.append(f"      <div class='domain-name'>{html.escape(run.domain)}</div>")
     lines.append("    </div>")
 
     lines.append("    <div class='stats'>")
@@ -988,10 +993,10 @@ def build_html(res: SubScanOut) -> str:
         f"      <span>No DNS<strong>{max(found - resolved, 0)}</strong></span>"
     )
     lines.append(f"      <span class='hits'>Web Hits<strong>{web_hits}</strong></span>")
-    lines.append(f"      <span>{res.elapsed:.2f}s</span>")
+    lines.append(f"      <span>{run.elapsed:.2f}s</span>")
     lines.append("    </div>")
 
-    if not res.subdomains:
+    if not run.subdomains:
         lines.append("    <p class='empty'>No subdomains discovered</p>")
     else:
         lines.append("    <table>")
@@ -1000,7 +1005,7 @@ def build_html(res: SubScanOut) -> str:
         )
         lines.append("      <tbody>")
 
-        for sub in res.subdomains:
+        for sub in run.subdomains:
             status_cls = "info"
             if 200 <= sub.status < 300:
                 status_cls = "status-2"
@@ -1050,11 +1055,11 @@ def build_html(res: SubScanOut) -> str:
         lines.append("      </tbody>")
         lines.append("    </table>")
 
-    if res.errors:
+    if run.errors:
         lines.append("    <details style='margin-top: 16px;'>")
         lines.append("      <summary>Show Errors</summary>")
         lines.append("      <div class='detail-box'>")
-        for err in res.errors:
+        for err in run.errors:
             lines.append(html.escape(err))
         lines.append("      </div>")
         lines.append("    </details>")
@@ -1457,8 +1462,8 @@ class SubScanner:
         prog: Progress,
         tid: Any,
         live: Live,
-        live_subs: List[SubInfo],
-    ) -> SubInfo:
+        live_subs: List[SubHit],
+    ) -> SubHit:
         t0 = time.perf_counter()
 
         ip = await self._resolve(sub)
@@ -1476,7 +1481,7 @@ class SubScanner:
             code, title, server, tech = 0, "", "", []
             sub_err = "no dns"
 
-        info = SubInfo(
+        info = SubHit(
             subdomain=sub,
             ip=ip,
             sources=sources,
@@ -1499,7 +1504,7 @@ class SubScanner:
 
     # main entry point
 
-    async def run(self) -> SubScanOut:
+    async def run(self) -> SubRun:
         started = datetime.now(timezone.utc)
         t0 = time.perf_counter()
         domain = self.cfg.domain
@@ -1589,7 +1594,7 @@ class SubScanner:
         # surface source errors right after enumeration
         if self._errors and not self.cfg.quiet:
             for e in self._errors:
-                console.print(Text(f"  ⚠  {e}", style=YELLOW))
+                console.print(Text(f"  WARN  {e}", style=YELLOW))
             console.print()
             self._errors.clear()
 
@@ -1632,7 +1637,7 @@ class SubScanner:
         subs_list = sorted(sub_sources.keys())
 
         if not subs_list:
-            return SubScanOut(
+            return SubRun(
                 domain=domain,
                 subdomains=[],
                 total_found=dedup_count,
@@ -1652,7 +1657,7 @@ class SubScanner:
             hr("Resolve  ·  Port Scan  ·  Scrape")
             console.print()
 
-        live_subs: List[SubInfo] = []
+        live_subs: List[SubHit] = []
         prog = mk_prog(transient=False)
         tid = prog.add_task(
             f"Processing {len(subs_list)} subdomains", total=len(subs_list)
@@ -1674,7 +1679,7 @@ class SubScanner:
             transient=True,
         )
 
-        all_results: List[SubInfo] = []
+        all_results: List[SubHit] = []
 
         async def _run_one(sub: str):
             info = await self._process_sub(
@@ -1713,7 +1718,7 @@ class SubScanner:
         all_results.sort(key=lambda x: x.subdomain)
         resolved = sum(1 for r in all_results if r.ip)
 
-        return SubScanOut(
+        return SubRun(
             domain=domain,
             subdomains=all_results,
             total_found=len(all_results),
@@ -1725,8 +1730,9 @@ class SubScanner:
         )
 
 
-def mk_parser() -> argparse.ArgumentParser:
+def build_parser(prog: Optional[str] = None) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
+        prog=prog,
         description="async subdomain enumerator: passive sources + async port scans + scraping",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1807,8 +1813,8 @@ def mk_parser() -> argparse.ArgumentParser:
     return p
 
 
-def run_cli(argv: Optional[List[str]] = None) -> int:
-    parser = mk_parser()
+def run_cli(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> int:
+    parser = build_parser(prog=prog)
     args = parser.parse_args(argv)
 
     # strip scheme if you typed a full url
@@ -1845,7 +1851,7 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
     scanner = SubScanner(cfg)
 
     try:
-        result = asyncio.run(scanner.run())
+        run = asyncio.run(scanner.run())
     except KeyboardInterrupt:
         console.print()
         console.print(Text("  Interrupted.", style=YELLOW))
@@ -1861,12 +1867,12 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
     finally:
         scanner.close()
 
-    show(result)
+    show_run(run)
 
-    if result.errors:
+    if run.errors:
         hr("Source Errors")
         console.print()
-        for e in result.errors:
+        for e in run.errors:
             console.print(Text(f"  {e}", style=DIMMER))
         console.print()
 
@@ -1875,12 +1881,12 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         if mode == "json":
             out_path.write_text(
-                json.dumps(result.to_dict(), indent=2), encoding="utf-8"
+                json.dumps(run.to_dict(), indent=2), encoding="utf-8"
             )
         elif mode == "csv":
-            out_path.write_text(_csv_sub(result), encoding="utf-8")
+            out_path.write_text(_sub_csv(run), encoding="utf-8")
         else:
-            out_path.write_text(build_html(result), encoding="utf-8")
+            out_path.write_text(build_sub_html(run), encoding="utf-8")
         if args.v:
             console.print(Text(f"  output mode  {mode}  ->  {out_path}", style=DIMMER))
         t = Text()
@@ -1890,6 +1896,15 @@ def run_cli(argv: Optional[List[str]] = None) -> int:
         console.print()
 
     return 0
+
+
+# compatibility aliases
+res_tbl = sub_tbl
+stats_tbl = sum_tbl
+show = show_run
+_csv_sub = _sub_csv
+build_html = build_sub_html
+mk_parser = build_parser
 
 
 def main():

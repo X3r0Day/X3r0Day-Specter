@@ -1,0 +1,21 @@
+pkgbase = specter-git
+	pkgdesc = Subdomain enumeration and TCP port scanning toolkit
+	pkgver = 0.1.0.r0.g0000000
+	pkgrel = 1
+	url = https://github.com/x3r0day/x3r0day-specter
+	arch = any
+	license = MIT
+	makedepends = git
+	makedepends = python-build
+	makedepends = python-installer
+	makedepends = python-setuptools
+	makedepends = python-wheel
+	depends = python
+	depends = python-rich
+	optdepends = nmap: aggressive service detection (-S) and sudo nmap mode (-U)
+	provides = specter
+	conflicts = specter
+	source = git+https://github.com/x3r0day/x3r0day-specter.git
+	sha256sums = SKIP
+
+pkgname = specter-git

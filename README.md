@@ -19,35 +19,78 @@ Subdomain enumeration and TCP port scanning.
 ## Install
 
 ```bash
-pip install rich
+pipx install .
+```
+
+`pipx` controls its own install output. If you see emoji or extra banner text
+during install, that is coming from `pipx`, not from Specter itself.
+
+From GitHub:
+
+```bash
+pipx install git+https://github.com/x3r0day/x3r0day-specter.git
+```
+
+### Arch Linux
+
+If you want a native package-manager install flow such as `yay -S specter`,
+publish an AUR package. This repo includes starter files under
+`packaging/aur`.
+
+Recommended package names:
+
+- `specter` for tagged releases
+- `specter-git` for tracking the main branch
+
+Once the AUR package is live, users can install it with:
+
+```bash
+yay -S specter
+```
+
+Or for the VCS package:
+
+```bash
+yay -S specter-git
+```
+
+Manual repo-local usage is still supported. If you are not installing through `pipx`,
+install the runtime dependency in your current Python environment first:
+
+```bash
+python3 -m pip install rich
+python3 -m specter --help
+python3 main.py --help
 ```
 
 ## Quick start
 
 ```bash
 # Subdomain enumeration
-python3 main.py subdomain example.com
+specter subdomain example.com
 
 # Subdomain with brute force
-python3 main.py subdomain example.com -b
+specter subdomain example.com -b
 
 # Save subdomain report
-python3 main.py subdomain example.com -o subdomains.html
+specter subdomain example.com -o subdomains.html
 
 # Port scan
-python3 main.py scanme.nmap.org
+specter scanme.nmap.org
 
 # Specific ports
-python3 main.py target.com -p 22,80,443
+specter target.com -p 22,80,443
 ```
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `python3 main.py subdomain <domain>` | Enumerate subdomains |
-| `python3 main.py scan <target>` | TCP port scan |
-| `python3 main.py <target>` | Default: TCP port scan |
+| `specter subdomain <domain>` | Enumerate subdomains |
+| `specter scan <target>` | TCP port scan |
+| `specter <target>` | Default: TCP port scan |
+| `python3 -m specter <command>` | Repo-local module entry point |
+| `python3 main.py <command>` | Backward-compatible local shim |
 
 ## Subdomain Enumeration
 
@@ -55,25 +98,25 @@ python3 main.py target.com -p 22,80,443
 
 ```bash
 # Passive enumeration
-python3 main.py subdomain example.com
+specter subdomain example.com
 
 # With brute force
-python3 main.py subdomain example.com -b
+specter subdomain example.com -b
 
 # Custom wordlist
-python3 main.py subdomain example.com -b -w words.txt
+specter subdomain example.com -b -w words.txt
 
 # Add Shodan
-python3 main.py subdomain example.com -K "$SHODAN_KEY"
+specter subdomain example.com -K "$SHODAN_KEY"
 
 # Skip web port checks
-python3 main.py subdomain example.com -N
+specter subdomain example.com -N
 
 # Skip page scraping
-python3 main.py subdomain example.com -W
+specter subdomain example.com -W
 
 # Save report
-python3 main.py subdomain example.com -o subdomains.html
+specter subdomain example.com -o subdomains.html
 ```
 
 ### Workflow
@@ -160,28 +203,28 @@ python3 main.py subdomain example.com -o subdomains.html
 
 ```bash
 # Basic scan (default: top 1000 ports)
-python3 main.py scanme.nmap.org
+specter scanme.nmap.org
 
 # Specific ports
-python3 main.py target.com -p 22,80,443,8080
+specter target.com -p 22,80,443,8080
 
 # Top 100 ports
-python3 main.py target.com -P 100
+specter target.com -P 100
 
 # All ports
-python3 main.py target.com -a
+specter target.com -a
 
 # Stealth mode
-python3 main.py target.com --stealth
+specter target.com --stealth
 
 # SYN scan (requires root)
-python3 main.py target.com --syn-scan
+specter target.com --syn-scan
 
 # Aggressive service detection
-python3 main.py target.com -S -U
+specter target.com -S -U
 
 # Save report
-python3 main.py target.com -o results.html
+specter target.com -o results.html
 ```
 
 ### Behavior
@@ -261,7 +304,8 @@ python3 main.py target.com -o results.html
 ## Requirements
 
 - Python 3.10+
-- Rich (`pip install rich`)
+- `pipx` for the recommended global install path
+- Rich for manual repo-local execution
 - Nmap (optional, for aggressive mode)
 
 `--syn-scan` needs root. `--sudo-nmap` prompts for sudo when using nmap.
@@ -270,8 +314,19 @@ python3 main.py target.com -o results.html
 
 ```
 x3r0day-specter/
+├── pyproject.toml
 ├── main.py
-├── src/
+├── packaging/
+│   └── aur/
+│       ├── LICENSE
+│       ├── README.md
+│       ├── specter/
+│       │   ├── PKGBUILD
+│       │   └── .SRCINFO
+│       └── specter-git/
+│           ├── PKGBUILD
+│           └── .SRCINFO
+├── specter/
 │   ├── scanner/
 │   │   ├── port_scan.py
 │   │   └── subdomain.py
