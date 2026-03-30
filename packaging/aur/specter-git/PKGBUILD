@@ -22,6 +22,7 @@ provides=("specter")
 conflicts=("specter")
 source=("git+$url.git")
 sha256sums=("SKIP")
+_pybin="/usr/bin/python"
 
 pkgver() {
   cd "$srcdir/x3r0day-specter"
@@ -41,12 +42,12 @@ pkgver() {
 
 build() {
   cd "$srcdir/x3r0day-specter"
-  python -m build --wheel --no-isolation
+  "$_pybin" -m build --wheel --no-isolation
 }
 
 package() {
   cd "$srcdir/x3r0day-specter"
-  python -m installer --destdir="$pkgdir" dist/*.whl
+  "$_pybin" -m installer --destdir="$pkgdir" dist/*.whl
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }
