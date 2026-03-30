@@ -64,3 +64,5 @@ result.json
 nmap_out.txt
 result/
 .env
+
+.codex/
