@@ -65,4 +65,5 @@ nmap_out.txt
 result/
 .env
 
+.codex
 .codex/
