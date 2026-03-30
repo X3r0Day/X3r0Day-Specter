@@ -22,8 +22,7 @@ Subdomain enumeration and TCP port scanning.
 pipx install .
 ```
 
-`pipx` controls its own install output. If you see emoji or extra banner text
-during install, that is coming from `pipx`, not from Specter itself.
+
 
 From GitHub:
 
@@ -33,16 +32,7 @@ pipx install git+https://github.com/x3r0day/x3r0day-specter.git
 
 ### Arch Linux
 
-If you want a native package-manager install flow such as `yay -S specter`,
-publish an AUR package. This repo includes starter files under
-`packaging/aur`.
-
-Recommended package names:
-
-- `specter` for tagged releases
-- `specter-git` for tracking the main branch
-
-Once the AUR package is live, users can install it with:
+Install with:
 
 ```bash
 yay -S specter
@@ -54,8 +44,7 @@ Or for the VCS package:
 yay -S specter-git
 ```
 
-Manual repo-local usage is still supported. If you are not installing through `pipx`,
-install the runtime dependency in your current Python environment first:
+### No installation usage
 
 ```bash
 python3 -m pip install rich
